@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wdn-anomaly-pipeline"
+version = "0.1.0"
+description = "Simulation pipeline for anomalous time-series data in water distribution networks"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Teodor Cioata", email = "t.cioata@student.rug.nl" }]
+requires-python = ">=3.10"
+dependencies = [
+    "wntr>=1.2.0",
+    "pandas>=2.2.0",
+    "pyarrow>=15.0.0",
+    "pyyaml>=6.0.0",
+    "pydantic>=2.0.0",
+    "matplotlib>=3.8.0",
+    "jupyter>=1.0.0",
+    "ipykernel>=6.29.0",
+    "duckdb>=0.10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=5.0.0",
+    "ruff>=0.4.0",
+]
+
+[project.scripts]
+wdn-pipeline = "wdn_pipeline.runner:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
