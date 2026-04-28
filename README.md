@@ -44,19 +44,6 @@ pip install -e ".[dev]"
 python -c "import wntr; print('wntr', wntr.__version__)"
 ```
 
-### Python 3.12 (optional upgrade)
-
-The system currently runs Python 3.10. To install Python 3.12 on Ubuntu:
-
-```bash
-sudo add-apt-repository ppa:deadsnakes/ppa
-sudo apt-get update
-sudo apt-get install python3.12 python3.12-venv
-python3.12 -m venv .venv
-```
-
----
-
 ## Running the Notebooks
 
 ```bash
