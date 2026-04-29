@@ -15,6 +15,7 @@ import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Annotated
 
 import numpy as np
 import typer
@@ -135,8 +136,18 @@ app = typer.Typer(add_completion=False, help="WDN Anomaly Simulation Pipeline")
 
 @app.command("run")
 def cli_run(
-    config: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True, help="Path to the YAML pipeline config."),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable INFO-level logging."),
+    config: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Path to the YAML pipeline config.",
+        ),
+    ],
+    verbose: Annotated[
+        bool, typer.Option("--verbose", "-v", help="Enable INFO-level logging.")
+    ] = False,
 ) -> None:
     """Run the pipeline for a single config and print a summary."""
 
