@@ -24,7 +24,7 @@ wdn-anomaly-pipeline/
 │       ├── validation.py    # Physics-based validation (PASS/WARNING/FAIL)
 │       ├── output.py        # Extensible writer interface (parquet, csv, ...)
 │       ├── runner.py        # End-to-end orchestrator + Typer CLI
-│       └── faults/          # Leak and sensor fault injectors (Phase 3-4)
+│       └── faults/          # Leak and sensor fault injectors 
 ├── notebooks/        # Jupyter exploration notebooks
 ├── tests/            # pytest unit and integration tests
 ├── outputs/          # Generated datasets and plots (gitignored)
@@ -114,11 +114,16 @@ scenario:
   type: normal                # normal | leak | sensor_fault | cumulative
   label: normal               # used in filenames + label column
 
+faults:
+  leaks: []                   # list of LeakSpec entries (see below)
+  sensor_faults: []           # placeholder until Phase 4
+
 validation:
   pressure_min_m: 0.0
   pressure_min_warning_tolerance_m: 1.0   # below this -> fail
   pressure_max_m: 150.0
   mass_balance_tol_m3s: 1.0e-3
+  leak_pressure_drop_min_m: 0.01          # warning floor for leak-aware drop check
 
 output:
   directory: outputs
@@ -126,7 +131,7 @@ output:
   write_metadata_sidecar: true
 ```
 
-### Demand modes (decision D4)
+### Demand modes
 
 - `default` — leave the .inp file's patterns untouched.
 - `scale` — multiply every junction's base demand by `scale.multiplier`.
@@ -134,21 +139,66 @@ output:
 
 Adding a new strategy means subclassing `DemandStrategy` in `demand.py` and registering it in `STRATEGIES`.
 
-### Output writers (decision D6)
+### Output writers
 
 `parquet` and `csv` ship out of the box. Each writer subclasses `Writer` in `output.py` and is registered in `WRITERS`. Adding DuckDB later (planned) is purely additive: a new subclass and registry entry, no other code changes.
 
-### Validation severity (decision D12)
+### Validation severity
 
-Three checks run on every scenario:
+Three baseline checks run on every scenario, plus one extra for leak scenarios:
 
 | Check | OK | WARNING | FAIL |
 |---|---|---|---|
 | `finite_values` | no NaN / inf | — | any NaN or inf |
 | `pressure_bounds` | within strict range | within tolerance band | beyond tolerance |
 | `mass_balance` | residual ≤ tol | — | residual > tol |
+| `leak_pressure_drop` (leak only) | drop ≥ floor at every leak | drop below floor or missing baseline | — |
 
-`WARNING` does not cause a non-zero exit code. The motivating example: Net3 produces a small negative pressure (~-0.66 m) at node `10` due to its known elevation/tank-cycle quirk. Both `WNTRSimulator` and the `EpanetSimulator` reference produce this; the validator surfaces it as a warning instead of failing the run.
+`WARNING` does not cause a non-zero exit code. The motivating example: Net3 produces a small negative pressure (~-0.66 m) at node `10` due to its known elevation/tank-cycle quirk. Both `WNTRSimulator` and the `EpanetSimulator` reference produce this; the validator surfaces it as a warning instead of failing the run. Leak scenarios amplify this dip slightly under PDD + leak conditions, so the `leak_abrupt_net3` config raises its `pressure_min_warning_tolerance_m` to 2 m.
+
+The mass-balance residual subtracts `leak_demand` from the demand side. Without that correction every leak scenario would fail by exactly the leak outflow at every active step.
+
+### Leak scenarios
+
+Add a list of `LeakSpec` entries under `faults.leaks`. Leaks require `simulation.demand_model: PDD` (D16) — the config validator rejects `DDA + leaks` outright with no silent auto-promotion.
+
+```yaml
+simulation:
+  demand_model: PDD           # required for any leak
+
+faults:
+  leaks:
+    - pipe: "40"              # explicit pipe name (or omit for random)
+      split_fraction: 0.5     # 0..1 along the pipe (or omit for random)
+      area_m2: 0.005          # OR diameter_m: 0.05 (mutually exclusive)
+      discharge_coeff: 0.75   # WNTR default
+      start_time_seconds: 21600
+      end_time_seconds: 64800
+      profile: abrupt         # abrupt | linear | step
+      profile_steps: 30       # only used by linear/step (default 30)
+      name: midday_central_leak
+```
+
+#### Profile semantics
+
+- `abrupt`: leak is fully active for the entire `[start_time, end_time]` window.
+- `linear`: area grows from `target_area / n` to `target_area` over `n = profile_steps` step controls. The default `n` is 30 — fine enough that the staircase reads as a smooth ramp at typical 1-h report timesteps.
+- `step`: same step-function rendering as `linear`; provided as a user-facing label so explicit "staircase" leaks remain semantically distinct in configs and metadata.
+
+#### Random vs explicit
+
+- Either `pipe` or `split_fraction` (or both) may be `None`; the runner draws values from `numpy.random.default_rng(seed)`. Random draws are reproducible: the same seed always selects the same pipe and fraction.
+- Provide exactly one of `area_m2` or `diameter_m` per leak. Diameters are converted internally via `area = π * (d/2)²`.
+- Multiple concurrent leaks are supported. Each leak inserts its own junction via `wntr.morph.split_pipe`; concurrent leaks may overlap in time.
+
+#### Example configs
+
+| Config | What it shows |
+|---|---|
+| `configs/leak_abrupt_net3.yaml` | Single explicit abrupt leak, 24 h Net3 with PDD, midday leak window |
+| `configs/leak_incipient_hanoi.yaml` | Linear-profile leak on Hanoi with Fourier demand, 30-step ramp |
+| `configs/leak_multi_jilin.yaml` | Two concurrent leaks (one abrupt, one incipient) on Jilin |
+| `configs/leak_random_fowm.yaml` | Fully random pipe + split fraction, demonstrating seed-driven reproducibility on FOWM |
 
 ---
 
@@ -158,53 +208,66 @@ Three checks run on every scenario:
 pytest
 ```
 
-Currently 50 tests covering every module: config schema, network loading, demand strategies, simulation, labelling, validation severity, output writers, and end-to-end runner.
+Currently 75 tests covering every module: config schema (with leak-spec validators), network loading, demand strategies, simulation, leak injection (abrupt + linear), labelling, validation severity (including leak-aware mass balance and pressure drop), output writers, and end-to-end runner.
 
 ---
 
-## Generating the Phase 2 Plots
+## Generating the Phase 3 Plots
 
 After at least one successful pipeline run:
 
 ```bash
-python scripts/generate_phase2_plots.py
+python scripts/generate_phase3_plots.py
 ```
 
 Outputs to `outputs/plots/`:
 
-- `pressure_timeseries_net3.png` — diurnal cycle at five representative nodes.
-- `flow_timeseries_net3.png` — flow at five representative pipes.
-- `pressure_heatmap_net3.png` — every node's pressure over time.
-- `determinism_residual_net3.png` — pressure residual between two pipeline runs on the same config; bounded at the numerical noise floor (~1e-14 m).
-- `validation_summary.txt` — full severity report for the example configs.
+- `pressure_timeseries_{network}.png` and `flow_timeseries_{network}.png` for FOWM, Jilin and Hanoi normal baselines.
+- `leak_pressure_drop_net3.png` — pressure at the leak node and 3 nearby nodes, baseline vs leak.
+- `leak_demand_profile_net3.png` — abrupt leak demand profile (zero outside the window, constant during).
+- `leak_incipient_profile_hanoi.png` — linear-profile leak demand showing the staircase rise.
+- `leak_pressure_heatmap_jilin.png` — every node's pressure over time for the multi-leak scenario, with leak onsets marked.
+- `leak_multi_demand_jilin.png` — both concurrent leaks' demand profiles overlaid.
+- `leak_residual_net3.png` — heatmap of `baseline − leak` pressure to isolate the leak's effect from the diurnal pattern.
+- `leak_residual_timeseries_net3.png` — line-plot version of the residual at nearby nodes.
+- `leak_determinism_fowm.png` — pressure residual between two identical leak runs (~1e-12 m, Newton noise floor).
+- `validation_summary_phase3.txt` — full severity report and key metrics for every config.
 
 ---
 
 ## Status
 
-### Phase 1: Setup and exploration (Weeks 1-2) — complete
+### Phase 1: Setup and exploration (Weeks 1) — complete
 
 - Environment setup (Python 3.12, venv, dependencies, repo structure)
 - Reference repos cloned (DiTEC-WDN, LeakG3PD)
 - WNTR basic experiments
 - Findings recorded in `notebooks/01_wntr_basics.ipynb`
 
-### Phase 2: Pipeline architecture and normal scenarios (Week 3) — complete
+### Phase 2: Pipeline architecture and normal scenarios (Week 2) — complete
 
-- Pydantic v2 config schema (D1, D2)
+- Pydantic v2 config schema
 - WaterNetworkModel loader with state isolation
-- Pluggable demand strategies (D4)
-- WNTRSimulator wrapper (D3)
-- Per-timestep labels + sidecar metadata YAML (D10)
-- PASS/WARNING/FAIL severity validation (D12) with finite, pressure-bound and mass-balance checks
-- Extensible Parquet/CSV writers (D6)
-- Typer CLI (D8)
-- 50 pytest tests, deterministic to ~1e-14 m
+- Pluggable demand strategies
+- WNTRSimulator wrapper
+- Per-timestep labels + sidecar metadata YAML
+- PASS/WARNING/FAIL severity validation with finite, pressure-bound and mass-balance checks
+- Extensible Parquet/CSV writers
+- Typer CLI
 - End-to-end working on Net3 (DDA) and Hanoi (Fourier demand)
+
+### Phase 3: pipe leak injection (Week 3)
+
+- Typed `LeakSpec` config model with mutual-exclusion (area xor diameter), seed-driven random pipe and split-fraction selection
+- Abrupt + linear/step incipient profiles via WNTR controls
+- Explicit PDD requirement enforced at config-load time
+- `leak_demand` exposed as a fourth output table (parquet + csv)
+- Leak-aware mass balance, leak pressure-drop check, leak labels in metadata
+- 75 pytest tests, deterministic to the WNTR Newton noise floor
+- Six new configs: normal + leak scenarios on Net3, Hanoi, Jilin and FOWM
 
 ### Upcoming
 
-- Phase 3: pipe leak injection (abrupt + incipient)
 - Phase 4: sensor fault models (bias, drift, stuck, dropout)
 - Phase 5: dataset organisation and DuckDB queryable export
 - Phase 6: report writing

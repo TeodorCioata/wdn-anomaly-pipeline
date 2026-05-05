@@ -13,10 +13,22 @@ over similarity to existing datasets. Each check returns a
 
 The aggregate :class:`ValidationReport` exposes overall severity, a
 ``passed`` shortcut (``True`` iff no ``fail``), and a printable summary.
+
+Leak scenarios add two leak-specific checks :
+
+- The mass-balance residual subtracts ``leak_demand`` from the demand
+  side. Without this fix every leak scenario would fail mass balance
+  by exactly the leak outflow.
+- A pressure-drop sanity check compares mean pressure at the leak
+  junction during the leak window to the mean over the pre-onset
+  baseline. The post-onset value must be lower; failure is a warning,
+  not a hard failure, because tiny leaks against high-static-head
+  baselines may not produce a visible drop.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -25,6 +37,7 @@ import pandas as pd
 from wntr.network import WaterNetworkModel
 
 from wdn_pipeline.config import ValidationConfig
+from wdn_pipeline.faults.leak import ResolvedLeak
 from wdn_pipeline.simulation import SimulationResults
 
 Severity = Literal["ok", "warning", "fail"]
@@ -179,19 +192,81 @@ def _check_mass_balance(
     results: SimulationResults,
     cfg: ValidationConfig,
 ) -> ValidationCheck:
+    """Net inflow minus (consumer demand + leak demand) at every junction.
+
+    The leak-demand term is critical: WNTR reports leak outflow in the
+    ``leak_demand`` frame separately from consumer ``demand``, so a
+    leak scenario without this correction registers a residual equal
+    to the leak outflow at every active step.
+    """
+
     incidence, junctions, links = _build_incidence(wn)
     flows = results.flowrate.reindex(columns=links).to_numpy()
     demands = results.demand.reindex(columns=junctions).to_numpy()
+    leak = (
+        results.leak_demand.reindex(columns=junctions)
+        .fillna(0.0)
+        .to_numpy()
+    )
     net_inflow = flows @ incidence.T
-    residual = net_inflow - demands
+    residual = net_inflow - demands - leak
     max_residual = float(np.abs(residual).max())
     severity: Severity = "ok" if max_residual <= cfg.mass_balance_tol_m3s else "fail"
     return ValidationCheck(
         "mass_balance",
         severity,
-        f"max |net_inflow - demand| = {max_residual:.3e} m^3/s "
+        f"max |net_inflow - demand - leak| = {max_residual:.3e} m^3/s "
         f"(tol {cfg.mass_balance_tol_m3s:.0e})",
     )
+
+
+def _check_leak_pressure_drop(
+    results: SimulationResults,
+    resolved_leaks: Sequence[ResolvedLeak],
+    cfg: ValidationConfig,
+) -> ValidationCheck:
+    """Mean leak-junction pressure must drop after leak onset.
+
+    For every resolved leak, compare the mean pressure at the leak
+    junction over ``[start_time, end_time]`` to the mean over
+    ``[0, start_time)``. The during-leak mean must be lower by at
+    least ``leak_pressure_drop_min_m``; otherwise we emit a warning.
+    Failure mode is intentionally soft: small leaks against
+    high-static-head networks can produce a real but tiny drop.
+    """
+
+    pressure = results.pressure
+    times = pressure.index.to_numpy()
+    issues: list[str] = []
+    summaries: list[str] = []
+    for leak in resolved_leaks:
+        if leak.leak_node_name not in pressure.columns:
+            issues.append(f"leak node {leak.leak_node_name} missing from results")
+            continue
+        col = pressure[leak.leak_node_name].to_numpy()
+        baseline_mask = times < leak.start_time_seconds
+        leak_mask = (times >= leak.start_time_seconds) & (times <= leak.end_time_seconds)
+        if not baseline_mask.any() or not leak_mask.any():
+            issues.append(
+                f"{leak.leak_node_name}: insufficient samples for baseline/leak window"
+            )
+            continue
+        baseline = float(col[baseline_mask].mean())
+        during = float(col[leak_mask].mean())
+        drop = baseline - during
+        summaries.append(
+            f"{leak.leak_node_name}: baseline={baseline:.3f}m during={during:.3f}m drop={drop:.3f}m"
+        )
+        if drop < cfg.leak_pressure_drop_min_m:
+            issues.append(
+                f"{leak.leak_node_name} drop {drop:.3f} m < min {cfg.leak_pressure_drop_min_m:.3f} m"
+            )
+
+    severity: Severity = "warning" if issues else "ok"
+    detail = "; ".join(summaries) if summaries else "no resolved leaks"
+    if issues:
+        detail += " | " + "; ".join(issues)
+    return ValidationCheck("leak_pressure_drop", severity, detail)
 
 
 def validate_normal_scenario(
@@ -206,6 +281,24 @@ def validate_normal_scenario(
             _check_finite(results),
             _check_pressure_bounds(results, cfg),
             _check_mass_balance(wn, results, cfg),
+        ]
+    )
+
+
+def validate_leak_scenario(
+    wn: WaterNetworkModel,
+    results: SimulationResults,
+    resolved_leaks: Sequence[ResolvedLeak],
+    cfg: ValidationConfig,
+) -> ValidationReport:
+    """Run normal-scenario checks plus the leak-specific ones (D17)."""
+
+    return ValidationReport(
+        checks=[
+            _check_finite(results),
+            _check_pressure_bounds(results, cfg),
+            _check_mass_balance(wn, results, cfg),
+            _check_leak_pressure_drop(results, resolved_leaks, cfg),
         ]
     )
 

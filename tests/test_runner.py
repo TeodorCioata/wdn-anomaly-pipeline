@@ -17,8 +17,8 @@ def test_run_net3_end_to_end(net3_config: PipelineConfig) -> None:
     assert summary.num_timesteps == 25
     assert summary.validation.passed  # warning is allowed; fail is not
     assert summary.metadata_path is not None and summary.metadata_path.is_file()
-    # Six data files (parquet + csv) x three tables = 6 files.
-    assert len(summary.output_paths) == 6
+    # Two formats (parquet + csv) x four tables (pressure/flowrate/demand/leak_demand) = 8 files.
+    assert len(summary.output_paths) == 8
     for p in summary.output_paths:
         assert p.exists()
 

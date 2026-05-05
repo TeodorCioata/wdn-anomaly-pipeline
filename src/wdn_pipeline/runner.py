@@ -2,7 +2,8 @@
 
 Pipeline order::
 
-    config -> network -> demand -> simulation -> validation -> labels -> output
+    config -> network -> demand -> [leak injection] -> simulation
+           -> validation -> labels -> output
 
 Both a Python entry point (:func:`run_from_config_file`) and a Typer
 CLI are exposed. The CLI is registered as the ``wdn-pipeline`` console
@@ -22,6 +23,7 @@ import typer
 
 from wdn_pipeline.config import PipelineConfig, load_config
 from wdn_pipeline.demand import apply_demand
+from wdn_pipeline.faults.leak import LeakInjector, ResolvedLeak
 from wdn_pipeline.labelling import build_labels
 from wdn_pipeline.network import derive_network_name, load_network
 from wdn_pipeline.output import (
@@ -31,7 +33,11 @@ from wdn_pipeline.output import (
     write_outputs,
 )
 from wdn_pipeline.simulation import SimulationResults, run_simulation
-from wdn_pipeline.validation import ValidationReport, validate_normal_scenario
+from wdn_pipeline.validation import (
+    ValidationReport,
+    validate_leak_scenario,
+    validate_normal_scenario,
+)
 
 logger = logging.getLogger("wdn_pipeline.runner")
 
@@ -48,6 +54,7 @@ class RunSummary:
     output_paths: list[Path]
     metadata_path: Path | None
     validation: ValidationReport
+    resolved_leaks: list[ResolvedLeak]
 
     def format(self) -> str:
         lines = [
@@ -58,8 +65,16 @@ class RunSummary:
             f"elapsed_seconds : {self.elapsed_seconds:.3f}",
             f"output_paths    : {[str(p) for p in self.output_paths]}",
             f"metadata_path   : {self.metadata_path}",
-            self.validation.format(),
         ]
+        if self.resolved_leaks:
+            lines.append(f"resolved_leaks  : {len(self.resolved_leaks)}")
+            for i, leak in enumerate(self.resolved_leaks):
+                lines.append(
+                    f"  [{i}] pipe={leak.pipe} split={leak.split_fraction:.3f} "
+                    f"area={leak.area_m2:.3e} m^2 profile={leak.profile} "
+                    f"window=[{leak.start_time_seconds},{leak.end_time_seconds}]s"
+                )
+        lines.append(self.validation.format())
         return "\n".join(lines)
 
 
@@ -88,15 +103,25 @@ def run(config: PipelineConfig) -> RunSummary:
     logger.info("Applying demand strategy: %s", config.demand.mode)
     apply_demand(wn, config.demand, config.seed)
 
+    if config.faults.leaks:
+        logger.info("Injecting %d leak(s)", len(config.faults.leaks))
+        rng = np.random.default_rng(config.seed)
+        resolved_leaks = LeakInjector().apply(wn, list(config.faults.leaks), rng)
+    else:
+        resolved_leaks = []
+
     logger.info("Running WNTR simulation")
     results: SimulationResults = run_simulation(wn)
     logger.info("Simulation finished in %.3fs", results.elapsed_seconds)
 
     logger.info("Building labels")
-    labels = build_labels(config, results.pressure.index, network_name)
+    labels = build_labels(config, results.pressure.index, network_name, resolved_leaks)
 
     logger.info("Validating outputs")
-    report = validate_normal_scenario(wn, results, config.validation)
+    if resolved_leaks:
+        report = validate_leak_scenario(wn, results, resolved_leaks, config.validation)
+    else:
+        report = validate_normal_scenario(wn, results, config.validation)
     logger.info("Validation severity: %s", report.severity.upper())
 
     basename = build_basename(network_name, config.scenario.label, config.seed)
@@ -121,6 +146,7 @@ def run(config: PipelineConfig) -> RunSummary:
         output_paths=write_result.data_paths,
         metadata_path=write_result.metadata_path,
         validation=report,
+        resolved_leaks=resolved_leaks,
     )
 
 

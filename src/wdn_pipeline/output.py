@@ -32,8 +32,10 @@ import yaml
 from wdn_pipeline.labelling import Labels
 from wdn_pipeline.simulation import SimulationResults
 
-# Names of the data tables we serialise per scenario.
-TABLE_NAMES = ("pressure", "flowrate", "demand")
+# Names of the data tables we serialise per scenario. ``leak_demand`` is
+# included unconditionally; for no-leak runs it is a zero frame matching
+# the pressure shape (see :class:`SimulationResults`).
+TABLE_NAMES = ("pressure", "flowrate", "demand", "leak_demand")
 
 
 @dataclass(frozen=True)

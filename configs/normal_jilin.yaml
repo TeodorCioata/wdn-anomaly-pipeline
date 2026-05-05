@@ -1,0 +1,28 @@
+# Normal scenario on Jilin (24h, 1h timestep).
+# Jilin.inp ships with one demand pattern, so we keep the .inp pattern
+# (default demand strategy) rather than overriding with Fourier.
+
+network:
+  inp_path: networks/Jilin.inp
+  name: jilin
+
+simulation:
+  duration_seconds: 86400          # 24 hours
+  hydraulic_timestep_seconds: 3600 # 1 hour
+  report_timestep_seconds: 3600
+  pattern_timestep_seconds: 3600
+  demand_model: DDA
+
+seed: 23
+
+demand:
+  mode: default
+
+scenario:
+  type: normal
+  label: normal
+
+output:
+  directory: outputs
+  formats: [parquet, csv]
+  write_metadata_sidecar: true
