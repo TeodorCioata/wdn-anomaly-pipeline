@@ -220,19 +220,94 @@ def _check_mass_balance(
     )
 
 
+def _check_leak_demand_active(
+    results: SimulationResults,
+    resolved_leaks: Sequence[ResolvedLeak],
+) -> ValidationCheck:
+    """Structural check: leak_demand is strictly positive while the leak is active.
+
+    Active window is the half-open interval ``[start, end)``. WNTR's
+    end-control flips ``leak_status`` to False at ``end_time_seconds``,
+    so the reported ``leak_demand`` at that exact timestep is already
+    zero by design and is not part of the active window.
+
+    This check is **not** confounded by diurnal demand patterns: it
+    asserts that the leak fires while it should and stops when it
+    should, independent of network-wide pressure trends. It replaces
+    the pre-onset-vs-during pressure-drop check as the primary
+    correctness signal for leak scenarios.
+    """
+
+    leak_df = results.leak_demand
+    times = leak_df.index.to_numpy()
+    issues: list[str] = []
+    summaries: list[str] = []
+    for leak in resolved_leaks:
+        if leak.leak_node_name not in leak_df.columns:
+            issues.append(f"leak node {leak.leak_node_name} missing from leak_demand")
+            continue
+        col = leak_df[leak.leak_node_name].to_numpy()
+        active = (times >= leak.start_time_seconds) & (times < leak.end_time_seconds)
+        inactive = ~active
+        n_active_samples = int(active.sum())
+        if n_active_samples == 0:
+            issues.append(
+                f"{leak.leak_node_name}: leak window covers no reported timesteps "
+                f"(start={leak.start_time_seconds}s, end={leak.end_time_seconds}s, "
+                f"report_step too coarse?)"
+            )
+            continue
+        active_min = float(col[active].min())
+        inactive_max = float(np.abs(col[inactive]).max()) if inactive.any() else 0.0
+        summaries.append(
+            f"{leak.leak_node_name}: active n={n_active_samples} "
+            f"min_active={active_min:.3e} m^3/s "
+            f"max|inactive|={inactive_max:.3e} m^3/s"
+        )
+        if active_min <= 0.0:
+            issues.append(
+                f"{leak.leak_node_name}: leak_demand <= 0 at an active timestep"
+            )
+        # Tight tolerance: WNTR reports exact zeros outside the
+        # half-open window; anything above 1e-12 m^3/s indicates a
+        # window-mismatch bug rather than numerical noise.
+        if inactive_max > 1e-12:
+            issues.append(
+                f"{leak.leak_node_name}: leak_demand non-zero outside active window "
+                f"(max |inactive| = {inactive_max:.3e})"
+            )
+
+    severity: Severity = "fail" if issues else "ok"
+    detail = "; ".join(summaries) if summaries else "no resolved leaks"
+    if issues:
+        detail += " | " + "; ".join(issues)
+    return ValidationCheck("leak_demand_active", severity, detail)
+
+
 def _check_leak_pressure_drop(
     results: SimulationResults,
     resolved_leaks: Sequence[ResolvedLeak],
     cfg: ValidationConfig,
 ) -> ValidationCheck:
-    """Mean leak-junction pressure must drop after leak onset.
+    """Soft diagnostic: mean leak-junction pressure should drop after onset.
 
-    For every resolved leak, compare the mean pressure at the leak
-    junction over ``[start_time, end_time]`` to the mean over
-    ``[0, start_time)``. The during-leak mean must be lower by at
-    least ``leak_pressure_drop_min_m``; otherwise we emit a warning.
-    Failure mode is intentionally soft: small leaks against
-    high-static-head networks can produce a real but tiny drop.
+    For every resolved leak this compares the mean pressure at the leak
+    junction over the half-open active window ``[start_time, end_time)``
+    to the mean over ``[0, start_time)``. The during-leak mean must be
+    lower by at least ``leak_pressure_drop_min_m``; otherwise we emit a
+    warning.
+
+    This check is **vulnerable to diurnal pressure trends**: a network
+    with rising afternoon demand can produce a higher mean pressure
+    during the leak window than before it (because the leak is
+    coincident with the demand peak) even though the leak is firing
+    correctly. For that reason this check never raises ``fail``; it is
+    purely informational and flagged as a warning so the supervisor
+    can inspect the residual heatmap, which isolates the leak's effect
+    cleanly. The structural correctness signal is the leak_demand
+    active check above. A future-phase improvement is to replace this
+    with a baseline-vs-leak residual comparison over matched
+    timestamps; that doubles simulator cost so it is not the default.
     """
 
     pressure = results.pressure
@@ -245,7 +320,7 @@ def _check_leak_pressure_drop(
             continue
         col = pressure[leak.leak_node_name].to_numpy()
         baseline_mask = times < leak.start_time_seconds
-        leak_mask = (times >= leak.start_time_seconds) & (times <= leak.end_time_seconds)
+        leak_mask = (times >= leak.start_time_seconds) & (times < leak.end_time_seconds)
         if not baseline_mask.any() or not leak_mask.any():
             issues.append(
                 f"{leak.leak_node_name}: insufficient samples for baseline/leak window"
@@ -259,7 +334,8 @@ def _check_leak_pressure_drop(
         )
         if drop < cfg.leak_pressure_drop_min_m:
             issues.append(
-                f"{leak.leak_node_name} drop {drop:.3f} m < min {cfg.leak_pressure_drop_min_m:.3f} m"
+                f"{leak.leak_node_name} drop {drop:.3f} m < min {cfg.leak_pressure_drop_min_m:.3f} m "
+                "(diurnal-confound, not a correctness signal)"
             )
 
     severity: Severity = "warning" if issues else "ok"
@@ -291,13 +367,25 @@ def validate_leak_scenario(
     resolved_leaks: Sequence[ResolvedLeak],
     cfg: ValidationConfig,
 ) -> ValidationReport:
-    """Run normal-scenario checks plus the leak-specific ones (D17)."""
+    """Run normal-scenario checks plus the leak-specific ones.
+
+    Two leak-specific checks run:
+
+    - ``leak_demand_active`` (structural, can ``fail``): leak_demand
+      is strictly positive while the leak is active and exactly zero
+      otherwise.
+    - ``leak_pressure_drop`` (diagnostic, only ``warning``): mean
+      pressure at the leak junction over the active window vs the
+      pre-onset baseline. Confounded by diurnal demand patterns; the
+      residual heatmap is a more reliable visual diagnostic.
+    """
 
     return ValidationReport(
         checks=[
             _check_finite(results),
             _check_pressure_bounds(results, cfg),
             _check_mass_balance(wn, results, cfg),
+            _check_leak_demand_active(results, resolved_leaks),
             _check_leak_pressure_drop(results, resolved_leaks, cfg),
         ]
     )

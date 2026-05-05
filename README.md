@@ -152,11 +152,14 @@ Three baseline checks run on every scenario, plus one extra for leak scenarios:
 | `finite_values` | no NaN / inf | — | any NaN or inf |
 | `pressure_bounds` | within strict range | within tolerance band | beyond tolerance |
 | `mass_balance` | residual ≤ tol | — | residual > tol |
-| `leak_pressure_drop` (leak only) | drop ≥ floor at every leak | drop below floor or missing baseline | — |
+| `leak_demand_active` (leak only) | leak_demand > 0 in `[start, end)` and exactly 0 outside | — | mismatch (window or solver bug) |
+| `leak_pressure_drop` (leak only) | drop ≥ floor at every leak | drop below floor (diurnal-confound, diagnostic) | — |
 
 `WARNING` does not cause a non-zero exit code. The motivating example: Net3 produces a small negative pressure (~-0.66 m) at node `10` due to its known elevation/tank-cycle quirk. Both `WNTRSimulator` and the `EpanetSimulator` reference produce this; the validator surfaces it as a warning instead of failing the run. Leak scenarios amplify this dip slightly under PDD + leak conditions, so the `leak_abrupt_net3` config raises its `pressure_min_warning_tolerance_m` to 2 m.
 
 The mass-balance residual subtracts `leak_demand` from the demand side. Without that correction every leak scenario would fail by exactly the leak outflow at every active step.
+
+Per-timestep labels and the `leak_demand_active` check both use a **half-open active window** `[start_time, end_time)`. WNTR's end control flips `leak_status=False` at `end_time_seconds`, so the reported `leak_demand` at that exact step is already zero by design. Including the end timestep would mark a normal frame as anomalous; the `leak_demand_active` validator polices this invariant and fails if the label disagrees with the simulator.
 
 ### Leak scenarios
 

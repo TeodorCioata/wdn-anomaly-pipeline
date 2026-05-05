@@ -541,9 +541,13 @@ def test_leak_label_window_matches_resolved(tmp_path: Path) -> None:
     pressure_path = next(p for p in summary.output_paths if "pressure.parquet" in p.name)
     df = pq.read_table(pressure_path).to_pandas().set_index("time_seconds")
     labels = df["label"].astype(int)
+    # Half-open window: end_time_seconds is excluded because WNTR's
+    # end-control sets leak_status=False at that exact tick, so
+    # leak_demand is already zero there. Including end_time_seconds in
+    # the label window would mark a normal frame as anomalous.
     expected = (
         (labels.index >= leak.start_time_seconds)
-        & (labels.index <= leak.end_time_seconds)
+        & (labels.index < leak.end_time_seconds)
     ).astype(int)
     pd.testing.assert_series_equal(
         labels.rename("x"),
@@ -584,6 +588,96 @@ def test_metadata_records_resolved_leaks(tmp_path: Path) -> None:
     assert entry["profile"] == "abrupt"
     assert entry["name"] == "test_leak"
     assert "leak_node_name" in entry
+
+
+def test_label_matches_leak_demand_at_every_step(tmp_path: Path) -> None:
+    """Per-timestep label must agree with leak_demand>0 everywhere.
+
+    Regression test for the inclusive-end off-by-one. WNTR's end control
+    sets leak_status=False at end_time_seconds, so leak_demand is zero
+    at that exact reported timestep. The label must use the same
+    half-open window.
+    """
+
+    leak = LeakSpec(
+        pipe="40",
+        split_fraction=0.5,
+        area_m2=0.005,
+        start_time_seconds=21600,
+        end_time_seconds=64800,
+        profile="abrupt",
+    )
+    cfg = _build_pdd_config(leaks=[leak], tmp_path=tmp_path)
+    cfg = cfg.model_copy(
+        update={
+            "validation": cfg.validation.model_copy(
+                update={"pressure_min_warning_tolerance_m": 2.0}
+            )
+        }
+    )
+    summary = run(cfg)
+    import pyarrow.parquet as pq
+
+    pressure_path = next(p for p in summary.output_paths if "pressure.parquet" in p.name)
+    leak_path = next(p for p in summary.output_paths if "leak_demand.parquet" in p.name)
+    pressure = pq.read_table(pressure_path).to_pandas().set_index("time_seconds")
+    leak_demand = pq.read_table(leak_path).to_pandas().set_index("time_seconds")
+    labels = pressure["label"].astype(int)
+    [resolved] = summary.resolved_leaks
+    leak_col = leak_demand[resolved.leak_node_name]
+    # label==1 implies leak_demand > 0
+    assert ((labels == 1) <= (leak_col > 0)).all()
+    # label==0 implies leak_demand == 0
+    assert ((labels == 0) <= (leak_col.abs() < 1e-12)).all()
+
+
+def test_leak_demand_active_check_fires_ok_for_correct_leak(tmp_path: Path) -> None:
+    leak = LeakSpec(
+        pipe="40",
+        split_fraction=0.5,
+        area_m2=0.005,
+        start_time_seconds=21600,
+        end_time_seconds=64800,
+        profile="abrupt",
+    )
+    cfg = _build_pdd_config(leaks=[leak], tmp_path=tmp_path)
+    cfg = cfg.model_copy(
+        update={
+            "validation": cfg.validation.model_copy(
+                update={"pressure_min_warning_tolerance_m": 2.0}
+            )
+        }
+    )
+    summary = run(cfg)
+    active = next(c for c in summary.validation.checks if c.name == "leak_demand_active")
+    assert active.severity == "ok"
+
+
+def test_leak_demand_active_check_fails_when_window_too_narrow(tmp_path: Path) -> None:
+    """If the leak window covers no reported step, the structural check fails."""
+
+    # 3600s report timestep but a 1-second leak window between report
+    # ticks: the leak fires inside one hydraulic step but never appears
+    # in a reported sample.
+    leak = LeakSpec(
+        pipe="40",
+        split_fraction=0.5,
+        area_m2=0.005,
+        start_time_seconds=21601,
+        end_time_seconds=21602,
+        profile="abrupt",
+    )
+    cfg = _build_pdd_config(leaks=[leak], tmp_path=tmp_path)
+    cfg = cfg.model_copy(
+        update={
+            "validation": cfg.validation.model_copy(
+                update={"pressure_min_warning_tolerance_m": 2.0}
+            )
+        }
+    )
+    summary = run(cfg)
+    active = next(c for c in summary.validation.checks if c.name == "leak_demand_active")
+    assert active.severity == "fail"
 
 
 def test_resolved_leak_to_dict_is_serialisable() -> None:

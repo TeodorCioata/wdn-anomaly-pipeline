@@ -39,7 +39,12 @@ def _leak_label_series(
         return labels
     times = labels.index.to_numpy()
     for leak in resolved_leaks:
-        mask = (times >= leak.start_time_seconds) & (times <= leak.end_time_seconds)
+        # Half-open window [start, end). WNTR's end control flips
+        # leak_status to False at end_time_seconds, so the reported
+        # leak_demand at that exact timestep is already zero. Including
+        # end_time_seconds in the label window would mark a normal frame
+        # as anomalous and disagree with leak_demand at every leak end.
+        mask = (times >= leak.start_time_seconds) & (times < leak.end_time_seconds)
         labels.loc[mask] = 1
     return labels
 
