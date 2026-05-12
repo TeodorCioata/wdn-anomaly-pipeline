@@ -1,0 +1,44 @@
+# Sensor bias fault on a Net3 pressure channel.
+# Bias of +2.0 m is added to junction "15"'s reported pressure between
+# 06:00 and 18:00. The hydraulic simulation is untouched; only the
+# reported sensor reading is corrupted.
+
+network:
+  inp_path: Net3
+  name: net3
+
+simulation:
+  duration_seconds: 86400          # 24 hours
+  hydraulic_timestep_seconds: 3600 # 1 hour
+  report_timestep_seconds: 3600
+  demand_model: DDA
+
+seed: 42
+
+demand:
+  mode: default
+
+scenario:
+  type: sensor_fault
+  label: sensor_bias
+
+faults:
+  sensor_faults:
+    - type: bias
+      quantity: pressure
+      target: "15"
+      bias_value: 2.0          # metres
+      start_time_seconds: 21600   # 06:00
+      end_time_seconds: 64800     # 18:00
+      name: midday_bias_node_15
+
+# Net3 node "10" baseline dip still applies. Widen the warning floor so
+# the pre-existing pressure-bounds warning does not get amplified to a
+# failure when the bias pushes other nodes' values higher.
+validation:
+  pressure_min_warning_tolerance_m: 1.0
+
+output:
+  directory: outputs
+  formats: [parquet, csv]
+  write_metadata_sidecar: true

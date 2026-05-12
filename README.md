@@ -116,7 +116,7 @@ scenario:
 
 faults:
   leaks: []                   # list of LeakSpec entries (see below)
-  sensor_faults: []           # placeholder until Phase 4
+  sensor_faults: []           # list of SensorFaultSpec entries (see below)
 
 validation:
   pressure_min_m: 0.0
@@ -203,6 +203,72 @@ faults:
 | `configs/leak_multi_jilin.yaml` | Two concurrent leaks (one abrupt, one incipient) on Jilin |
 | `configs/leak_random_fowm.yaml` | Fully random pipe + split fraction, demonstrating seed-driven reproducibility on FOWM |
 
+### Sensor fault scenarios (Phase 4 Week 5)
+
+Sensor faults corrupt the reported pressure or flowrate at a single channel **after** the hydraulic simulation has run (decision D5). The simulator output is preserved verbatim in `pressure_clean` / `flowrate_clean` so downstream consumers always have the uncorrupted ground truth.
+
+```yaml
+faults:
+  sensor_faults:
+    - type: bias              # bias | drift | stuck | dropout | noise
+      quantity: pressure      # pressure (junction) | flowrate (link)
+      target: "15"            # explicit name OR null for random
+      start_time_seconds: 21600
+      end_time_seconds: 64800
+      name: midday_bias_node_15
+
+      # Per-type fields. Provide the ones for the chosen `type`:
+      bias_value: 2.0         # required for type=bias (non-zero)
+      slope_per_second: 0.001 # required for type=drift, units/sec
+      intervals:              # required for type=dropout
+        - [21600, 28800]      # half-open sub-windows inside [start, end)
+      fill_value: null        # dropout: null = NaN, else numeric
+      sigma: 1.0              # required for type=noise (> 0)
+      rng_offset: 0           # optional per-fault offset for noise RNG
+```
+
+#### Fault formulas
+
+For true reading `y(t)` over the half-open window `[start, end)`:
+
+| Fault | Formula |
+|---|---|
+| `bias` | `y'(t) = y(t) + bias_value` |
+| `drift` | `y'(t) = y(t) + slope_per_second * (t - start)` |
+| `stuck` | `y'(t) = y(start)` |
+| `dropout` | `y'(t) = NaN` (or `fill_value`) for `t` in each sub-interval; samples outside the sub-intervals are unchanged |
+| `noise` | `y'(t) = y(t) + epsilon`, `epsilon ~ N(0, sigma^2)` |
+
+#### Random target selection (D19)
+
+Set `target: null` to draw a target from the scenario RNG. Pressure faults sample from `wn.junction_name_list`; flowrate faults sample from `wn.pipe_name_list`. Random draws are reproducible: the same seed always picks the same target.
+
+#### Output layout for sensor scenarios
+
+- `*_pressure` and `*_flowrate` tables: corrupted signals, with the per-channel mask columns `{fault_type}_mask_{target}` appended (decision D26).
+- `*_pressure_clean` and `*_flowrate_clean` tables: uncorrupted simulator output, identical to the corrupted siblings when no sensor faults run.
+- The sidecar metadata YAML records every resolved sensor fault under `fault_summary.sensor_faults` (long-form event list, source of truth per D22).
+- Per-timestep `label` is the **union** of every active leak + sensor fault window.
+
+#### Validation (D23)
+
+Two new structural checks run for any scenario that includes sensor faults:
+
+| Check | OK | FAIL |
+|---|---|---|
+| `sensor_fault_mask_consistent` | per-channel mask covers exactly `[start, end)` (or, for dropout, the sub-intervals) | mask disagrees with the spec at any timestep |
+| `sensor_fault_signal_applied` | corrupted minus clean matches the fault formula to numerical tolerance (for noise: residual mean within `4*sigma/sqrt(n)` and std within 30% of sigma) | residual deviates from the spec |
+
+#### Example sensor configs
+
+| Config | Fault | What it shows |
+|---|---|---|
+| `configs/sensor_bias_net3.yaml` | bias | +2 m offset on junction 15 between 06:00 and 18:00 |
+| `configs/sensor_drift_net3.yaml` | drift | 0.001 m/s linear ramp on junction 15 between 04:00 and 20:00 |
+| `configs/sensor_stuck_net3.yaml` | stuck | Junction 15 frozen at 08:00 value through the end of the day |
+| `configs/sensor_dropout_net3.yaml` | dropout | Three NaN-filled 2-hour gaps on junction 15 |
+| `configs/sensor_noise_net3.yaml` | noise | sigma=1 m Gaussian noise on junction 15, full-day |
+
 ---
 
 ## Running Tests
@@ -211,7 +277,7 @@ faults:
 pytest
 ```
 
-Currently 75 tests covering every module: config schema (with leak-spec validators), network loading, demand strategies, simulation, leak injection (abrupt + linear), labelling, validation severity (including leak-aware mass balance and pressure drop), output writers, and end-to-end runner.
+Currently 115 tests covering every module: config schema (with leak-spec and sensor-fault validators), network loading, demand strategies, simulation, leak injection (abrupt + linear + multi), sensor fault injection (bias / drift / stuck / dropout / noise), labelling, validation severity (leak-aware mass balance, leak demand active, sensor fault mask consistency, sensor fault signal applied), output writers, and end-to-end runner determinism.
 
 ---
 
@@ -269,9 +335,20 @@ Outputs to `outputs/plots/`:
 - 75 pytest tests, deterministic to the WNTR Newton noise floor
 - Six new configs: normal + leak scenarios on Net3, Hanoi, Jilin and FOWM
 
+### Phase 4 Week 5: sensor fault models — complete
+
+- Typed `SensorFaultSpec` with discriminated `type` field (bias / drift / stuck / dropout / noise)
+- Post-simulation injector preserving clean signals in `pressure_clean` / `flowrate_clean`
+- Half-open `[start, end)` fault windows consistent with Phase 3 leaks
+- Random vs explicit target selection mirroring Phase 3 leak placement
+- Two structural validators that can fail (`sensor_fault_mask_consistent`, `sensor_fault_signal_applied`)
+- Per-channel mask columns in the corrupted output tables (`{type}_mask_{target}`)
+- Five Net3 sensor configs and `scripts/generate_week5_plots.py`
+
 ### Upcoming
 
-- Phase 4: sensor fault models (bias, drift, stuck, dropout)
+- Phase 4 Week 6: cumulative anomalies (leak + sensor faults in the same scenario)
+- Phase 4 Week 7: batch generation, dataset polish, Phase 4 plots and briefing
 - Phase 5: dataset organisation and DuckDB queryable export
 - Phase 6: report writing
 

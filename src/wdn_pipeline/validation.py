@@ -38,6 +38,7 @@ from wntr.network import WaterNetworkModel
 
 from wdn_pipeline.config import ValidationConfig
 from wdn_pipeline.faults.leak import ResolvedLeak
+from wdn_pipeline.faults.sensor import ResolvedSensorFault
 from wdn_pipeline.simulation import SimulationResults
 
 Severity = Literal["ok", "warning", "fail"]
@@ -345,6 +346,228 @@ def _check_leak_pressure_drop(
     return ValidationCheck("leak_pressure_drop", severity, detail)
 
 
+def _check_sensor_fault_mask_consistent(
+    results: SimulationResults,
+    resolved_faults: Sequence[ResolvedSensorFault],
+    masks: dict[str, pd.Series],
+) -> ValidationCheck:
+    """Structural check: each fault's mask matches its [start, end) window.
+
+    For dropout faults the mask is the union of the configured
+    sub-intervals (a strict subset of the outer window). For every
+    other type the mask must equal the outer window mask exactly.
+    """
+
+    if not resolved_faults:
+        return ValidationCheck(
+            "sensor_fault_mask_consistent", "ok", "no sensor faults"
+        )
+
+    time_index = results.pressure.index
+    times = time_index.to_numpy()
+    issues: list[str] = []
+
+    for fault in resolved_faults:
+        mask_col = f"{fault.type}_mask_{fault.target}"
+        if mask_col not in masks:
+            issues.append(f"{mask_col}: mask not produced by injector")
+            continue
+        actual = masks[mask_col].to_numpy(dtype=bool)
+        if fault.type == "dropout":
+            expected = np.zeros_like(times, dtype=bool)
+            for a, b in fault.intervals or []:
+                expected |= (times >= int(a)) & (times < int(b))
+        else:
+            expected = (times >= fault.start_time_seconds) & (
+                times < fault.end_time_seconds
+            )
+        if not np.array_equal(actual, expected):
+            n_diff = int(np.sum(actual != expected))
+            issues.append(
+                f"{mask_col}: mask disagrees with window at {n_diff} timesteps"
+            )
+
+    severity: Severity = "fail" if issues else "ok"
+    detail = (
+        f"checked {len(resolved_faults)} fault mask(s)"
+        if not issues
+        else "; ".join(issues)
+    )
+    return ValidationCheck("sensor_fault_mask_consistent", severity, detail)
+
+
+def _check_sensor_fault_signal_applied(
+    results: SimulationResults,
+    resolved_faults: Sequence[ResolvedSensorFault],
+) -> ValidationCheck:
+    """Structural check: corrupted minus clean matches the spec formula.
+
+    Bias / drift / stuck / dropout are exact comparisons (up to
+    floating-point tolerance). Noise is validated statistically: the
+    residual must have near-zero mean (within ``4*sigma/sqrt(n)``) and
+    its sample std must be near sigma (relative tolerance 30% to absorb
+    small samples, default for Net3's 24-hour 1-hour-step grid).
+    """
+
+    if not resolved_faults:
+        return ValidationCheck(
+            "sensor_fault_signal_applied", "ok", "no sensor faults"
+        )
+
+    issues: list[str] = []
+    summaries: list[str] = []
+    for fault in resolved_faults:
+        if fault.quantity == "pressure":
+            clean_df = results.pressure_clean
+            corrupted_df = results.pressure
+        else:
+            clean_df = results.flowrate_clean
+            corrupted_df = results.flowrate
+
+        if fault.target not in corrupted_df.columns:
+            issues.append(
+                f"{fault.type}@{fault.target}: target missing from corrupted frame"
+            )
+            continue
+
+        clean = clean_df[fault.target].to_numpy(dtype=float)
+        corrupted = corrupted_df[fault.target].to_numpy(dtype=float)
+        times = corrupted_df.index.to_numpy()
+        active = (times >= fault.start_time_seconds) & (
+            times < fault.end_time_seconds
+        )
+        inactive = ~active
+
+        # Outside the fault window the two must match bit-for-bit
+        # (dropout's outer window is the same; the sub-intervals all
+        # lie inside).
+        if inactive.any():
+            outside_diff = float(
+                np.nanmax(np.abs(corrupted[inactive] - clean[inactive]))
+                if np.any(np.isfinite(corrupted[inactive]) & np.isfinite(clean[inactive]))
+                else 0.0
+            )
+            if outside_diff > 1e-9:
+                issues.append(
+                    f"{fault.type}@{fault.target}: corrupted differs from clean "
+                    f"outside fault window (max |diff| = {outside_diff:.3e})"
+                )
+
+        if fault.type == "bias":
+            inside_diff = corrupted[active] - clean[active]
+            expected = float(fault.bias_value)  # type: ignore[arg-type]
+            max_err = float(np.max(np.abs(inside_diff - expected)))
+            summaries.append(
+                f"bias@{fault.target}: residual={inside_diff.mean():.3f} "
+                f"(expected {expected:.3f}, max_err={max_err:.3e})"
+            )
+            if max_err > 1e-9:
+                issues.append(
+                    f"bias@{fault.target}: residual deviates from bias_value "
+                    f"(max_err={max_err:.3e})"
+                )
+        elif fault.type == "drift":
+            slope = float(fault.slope_per_second)  # type: ignore[arg-type]
+            dt = times[active] - fault.start_time_seconds
+            expected_curve = slope * dt
+            inside_diff = corrupted[active] - clean[active]
+            max_err = float(np.max(np.abs(inside_diff - expected_curve)))
+            summaries.append(
+                f"drift@{fault.target}: slope={slope:.3e}/s n_active={int(active.sum())} "
+                f"max_err={max_err:.3e}"
+            )
+            if max_err > 1e-9:
+                issues.append(
+                    f"drift@{fault.target}: residual deviates from "
+                    f"slope * dt (max_err={max_err:.3e})"
+                )
+        elif fault.type == "stuck":
+            active_idx = np.where(active)[0]
+            if active_idx.size == 0:
+                summaries.append(f"stuck@{fault.target}: no active samples")
+                continue
+            stuck_value = float(clean[active_idx[0]])
+            inside_vals = corrupted[active]
+            max_err = float(np.max(np.abs(inside_vals - stuck_value)))
+            summaries.append(
+                f"stuck@{fault.target}: stuck_value={stuck_value:.3f} "
+                f"max_err={max_err:.3e}"
+            )
+            if max_err > 1e-9:
+                issues.append(
+                    f"stuck@{fault.target}: corrupted differs from "
+                    f"y(start) (max_err={max_err:.3e})"
+                )
+        elif fault.type == "dropout":
+            fill_is_nan = fault.fill_value is None
+            # Build the sub-interval mask.
+            sub_active = np.zeros_like(times, dtype=bool)
+            for a, b in fault.intervals or []:
+                sub_active |= (times >= int(a)) & (times < int(b))
+            inside_vals = corrupted[sub_active]
+            if fill_is_nan:
+                ok = bool(np.all(np.isnan(inside_vals)))
+                summaries.append(
+                    f"dropout@{fault.target}: NaN-filled {int(sub_active.sum())} sample(s)"
+                )
+                if not ok:
+                    issues.append(
+                        f"dropout@{fault.target}: not all dropout samples are NaN"
+                    )
+            else:
+                fill = float(fault.fill_value)  # type: ignore[arg-type]
+                max_err = (
+                    float(np.max(np.abs(inside_vals - fill)))
+                    if inside_vals.size
+                    else 0.0
+                )
+                summaries.append(
+                    f"dropout@{fault.target}: fill={fill:.3f} max_err={max_err:.3e}"
+                )
+                if max_err > 1e-9:
+                    issues.append(
+                        f"dropout@{fault.target}: corrupted differs from fill_value "
+                        f"(max_err={max_err:.3e})"
+                    )
+        elif fault.type == "noise":
+            sigma = float(fault.sigma)  # type: ignore[arg-type]
+            inside_diff = corrupted[active] - clean[active]
+            n = inside_diff.size
+            if n == 0:
+                summaries.append(f"noise@{fault.target}: no active samples")
+                continue
+            mean = float(np.mean(inside_diff))
+            std = float(np.std(inside_diff, ddof=0))
+            # Statistical tolerances: 4*sigma/sqrt(n) is ~99.99% CI for
+            # the sample mean of a Gaussian. Std uses a 30% relative
+            # band to absorb small sample sizes (Net3's 24-hour-1-hour
+            # grid has at most 25 samples).
+            mean_tol = max(4.0 * sigma / max(1.0, n**0.5), 1e-9)
+            std_tol = max(0.30 * sigma, 1e-9)
+            summaries.append(
+                f"noise@{fault.target}: n={n} mean={mean:.3e} std={std:.3f} "
+                f"(sigma={sigma:.3f})"
+            )
+            if abs(mean) > mean_tol:
+                issues.append(
+                    f"noise@{fault.target}: residual mean {mean:.3e} exceeds tolerance "
+                    f"{mean_tol:.3e}"
+                )
+            if abs(std - sigma) > std_tol:
+                issues.append(
+                    f"noise@{fault.target}: residual std {std:.3f} deviates from "
+                    f"sigma {sigma:.3f} by more than {std_tol:.3f}"
+                )
+        else:
+            issues.append(f"unknown sensor fault type: {fault.type}")
+
+    severity: Severity = "fail" if issues else "ok"
+    detail = "; ".join(summaries) if summaries else "no checks executed"
+    if issues:
+        detail += " | " + "; ".join(issues)
+    return ValidationCheck("sensor_fault_signal_applied", severity, detail)
+
+
 def validate_normal_scenario(
     wn: WaterNetworkModel,
     results: SimulationResults,
@@ -387,6 +610,61 @@ def validate_leak_scenario(
             _check_mass_balance(wn, results, cfg),
             _check_leak_demand_active(results, resolved_leaks),
             _check_leak_pressure_drop(results, resolved_leaks, cfg),
+        ]
+    )
+
+
+def validate_sensor_fault_scenario(
+    wn: WaterNetworkModel,
+    results: SimulationResults,
+    resolved_sensor_faults: Sequence[ResolvedSensorFault],
+    masks: dict[str, pd.Series],
+    cfg: ValidationConfig,
+) -> ValidationReport:
+    """Run normal-scenario checks plus the two structural sensor-fault checks.
+
+    ``finite_values`` is intentionally skipped for the corrupted
+    ``pressure`` / ``flowrate`` frames when dropout faults are present
+    (NaN is the *correct* output there). The clean-signal frames are
+    still validated to catch any genuine simulator NaNs.
+    """
+
+    has_dropout = any(f.type == "dropout" for f in resolved_sensor_faults)
+    if has_dropout:
+        # Validate finiteness on the clean ground-truth signals; the
+        # corrupted ones may legitimately contain NaN.
+        clean_results = SimulationResults(
+            pressure=results.pressure_clean,
+            flowrate=results.flowrate_clean,
+            demand=results.demand,
+            leak_demand=results.leak_demand,
+            elapsed_seconds=results.elapsed_seconds,
+            pressure_clean=results.pressure_clean,
+            flowrate_clean=results.flowrate_clean,
+        )
+        finite_check = _check_finite(clean_results)
+        finite_check = ValidationCheck(
+            name=finite_check.name,
+            severity=finite_check.severity,
+            detail="(clean signals only; dropout NaNs are expected) "
+            + finite_check.detail,
+        )
+        bounds_check = _check_pressure_bounds(clean_results, cfg)
+        mass_check = _check_mass_balance(wn, clean_results, cfg)
+    else:
+        finite_check = _check_finite(results)
+        bounds_check = _check_pressure_bounds(results, cfg)
+        mass_check = _check_mass_balance(wn, results, cfg)
+
+    return ValidationReport(
+        checks=[
+            finite_check,
+            bounds_check,
+            mass_check,
+            _check_sensor_fault_mask_consistent(
+                results, resolved_sensor_faults, masks
+            ),
+            _check_sensor_fault_signal_applied(results, resolved_sensor_faults),
         ]
     )
 

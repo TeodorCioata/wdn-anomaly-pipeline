@@ -1,0 +1,44 @@
+# Sensor drift fault on a Net3 pressure channel.
+# Junction "15"'s reported pressure drifts linearly at 0.001 m/s between
+# 04:00 and 20:00 (~16 hours). Over the full window the offset reaches
+# ~57.6 m, which simulates a long-running calibration drift.
+
+network:
+  inp_path: Net3
+  name: net3
+
+simulation:
+  duration_seconds: 86400          # 24 hours
+  hydraulic_timestep_seconds: 3600 # 1 hour
+  report_timestep_seconds: 3600
+  demand_model: DDA
+
+seed: 42
+
+demand:
+  mode: default
+
+scenario:
+  type: sensor_fault
+  label: sensor_drift
+
+faults:
+  sensor_faults:
+    - type: drift
+      quantity: pressure
+      target: "15"
+      slope_per_second: 0.001  # m/s
+      start_time_seconds: 14400   # 04:00
+      end_time_seconds: 72000     # 20:00
+      name: long_drift_node_15
+
+# Drift sends the corrupted pressure well above the strict upper bound;
+# raise the upper limit so the signal-applied check is the gate, not
+# the absolute-bounds check.
+validation:
+  pressure_max_m: 250.0
+
+output:
+  directory: outputs
+  formats: [parquet, csv]
+  write_metadata_sidecar: true

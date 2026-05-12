@@ -19,20 +19,33 @@ from wntr.network import WaterNetworkModel
 
 @dataclass(frozen=True)
 class SimulationResults:
-    """Time-series outputs of a single simulation.
+    """Time-series outputs of a single simulation, plus clean baselines.
 
     All DataFrames share the same index: time in seconds since
     simulation start, sampled at the report timestep.
 
+    ``pressure`` and ``flowrate`` are the signals that flow downstream
+    to labelling and output. After sensor faults run they are the
+    *corrupted* signals. ``pressure_clean`` and ``flowrate_clean``
+    always carry the uncorrupted simulator output (Option A from
+    `docs/phase4_plan.md` §3.5). For runs with no sensor faults the
+    clean and corrupted frames are equal element-by-element.
+
     Attributes:
         pressure: rows = time, columns = node names. Pressure in metres.
+            May be sensor-corrupted.
         flowrate: rows = time, columns = link names. Flow in m^3/s.
+            May be sensor-corrupted.
         demand: rows = time, columns = node names. Actual demand
             delivered (matches base_demand * pattern under DDA).
         leak_demand: rows = time, columns = node names. Volumetric leak
             outflow at each junction in m^3/s. Empty (zero columns) for
             scenarios that did not inject leaks.
         elapsed_seconds: Wall-clock time the simulation took to run.
+        pressure_clean: Uncorrupted pressure ground truth. Always
+            present; equals ``pressure`` when no sensor faults run.
+        flowrate_clean: Uncorrupted flowrate ground truth. Always
+            present; equals ``flowrate`` when no sensor faults run.
     """
 
     pressure: pd.DataFrame
@@ -40,6 +53,8 @@ class SimulationResults:
     demand: pd.DataFrame
     leak_demand: pd.DataFrame
     elapsed_seconds: float
+    pressure_clean: pd.DataFrame
+    flowrate_clean: pd.DataFrame
 
 
 def run_simulation(wn: WaterNetworkModel) -> SimulationResults:
@@ -71,4 +86,6 @@ def run_simulation(wn: WaterNetworkModel) -> SimulationResults:
         demand=demand,
         leak_demand=leak_demand,
         elapsed_seconds=elapsed,
+        pressure_clean=pressure.copy(),
+        flowrate_clean=flowrate.copy(),
     )

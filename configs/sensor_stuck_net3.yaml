@@ -1,0 +1,39 @@
+# Sensor stuck fault on a Net3 pressure channel.
+# Junction "15"'s reported pressure freezes at the value it reported at
+# 08:00 and stays there until the end of the simulation.
+
+network:
+  inp_path: Net3
+  name: net3
+
+simulation:
+  duration_seconds: 86400          # 24 hours
+  hydraulic_timestep_seconds: 3600 # 1 hour
+  report_timestep_seconds: 3600
+  demand_model: DDA
+
+seed: 42
+
+demand:
+  mode: default
+
+scenario:
+  type: sensor_fault
+  label: sensor_stuck
+
+faults:
+  sensor_faults:
+    - type: stuck
+      quantity: pressure
+      target: "15"
+      start_time_seconds: 28800   # 08:00
+      end_time_seconds: 86400     # end of day (24:00)
+      name: stuck_after_8am_node_15
+
+validation:
+  pressure_min_warning_tolerance_m: 1.0
+
+output:
+  directory: outputs
+  formats: [parquet, csv]
+  write_metadata_sidecar: true

@@ -2,9 +2,9 @@
 
 The pipeline is driven by YAML configs that describe a single scenario:
 which network to load, simulation timing, demand-pattern strategy, the
-random seed, fault injections (Phase 3 leaks, Phase 4 sensor faults
-still pending) and output settings. This module loads, validates and
-exposes those settings as immutable typed objects.
+random seed, fault injections (Phase 3 leaks, Phase 4 sensor faults)
+and output settings. This module loads, validates and exposes those
+settings as immutable typed objects.
 """
 
 from __future__ import annotations
@@ -186,18 +186,126 @@ class LeakSpec(_Frozen):
         return self
 
 
+class SensorFaultSpec(_Frozen):
+    """Specification for a single sensor fault (Phase 4, D18-D25).
+
+    Sensor faults are applied **post-simulation** (D5): they corrupt the
+    reported pressure or flowrate at a single channel without modifying
+    the hydraulic model. Five fault types are supported, discriminated
+    by ``type``. Each fault uses the half-open window convention
+    ``[start_time_seconds, end_time_seconds)`` consistent with Phase 3
+    leaks.
+
+    Attributes:
+        type: One of ``bias`` / ``drift`` / ``stuck`` / ``dropout`` /
+            ``noise``. Acts as the type discriminator for downstream
+            dispatch in :mod:`wdn_pipeline.faults.sensor`.
+        quantity: Which output table to corrupt. ``pressure`` targets
+            a junction; ``flowrate`` targets a pipe.
+        target: Channel name (junction for pressure, link for flowrate)
+            or ``None`` to draw a target from the scenario RNG (D19).
+            The injector validates the resolved name against the loaded
+            network; config-load time does not see the network yet.
+        start_time_seconds: Fault switches on at this time (inclusive).
+        end_time_seconds: Fault switches off at this time (exclusive).
+            Strictly greater than ``start_time_seconds`` and no greater
+            than ``simulation.duration_seconds``.
+        name: Optional human-readable label, surfaced in resolved
+            metadata.
+        bias_value: Constant offset for the ``bias`` fault. Non-zero
+            (a zero bias is a no-op and is rejected as a likely config
+            mistake).
+        slope_per_second: Linear drift rate for the ``drift`` fault, in
+            units of the quantity per second. Sign determines drift
+            direction.
+        intervals: For the ``dropout`` fault, a list of
+            ``[start, end)`` sub-intervals within the outer fault
+            window. Each interval is independently validated.
+        fill_value: For the ``dropout`` fault, the value written into
+            corrupted samples. ``None`` (default) means NaN, per D21.
+        sigma: Standard deviation of additive Gaussian noise for the
+            ``noise`` fault. Must be strictly positive.
+        rng_offset: Optional per-fault offset for the noise RNG. Lets
+            two ``noise`` faults in the same scenario draw independent
+            sample streams without changing the scenario seed.
+    """
+
+    type: Literal["bias", "drift", "stuck", "dropout", "noise"]
+    quantity: Literal["pressure", "flowrate"] = "pressure"
+    target: str | None = None
+    start_time_seconds: Annotated[int, Field(ge=0)]
+    end_time_seconds: Annotated[int, Field(gt=0)]
+    name: str | None = None
+
+    # Per-type fields. All optional at the schema level; the
+    # _validate_sensor_fault model_validator enforces presence/absence
+    # based on ``type`` so the YAML stays simple to write.
+    bias_value: float | None = None
+    slope_per_second: float | None = None
+    intervals: list[tuple[int, int]] | None = None
+    fill_value: float | None = None
+    sigma: float | None = None
+    rng_offset: int = 0
+
+    @model_validator(mode="after")
+    def _validate_sensor_fault(self) -> SensorFaultSpec:
+        if self.end_time_seconds <= self.start_time_seconds:
+            raise ValueError("end_time_seconds must be > start_time_seconds")
+
+        if self.type == "bias":
+            if self.bias_value is None:
+                raise ValueError("bias fault requires 'bias_value'")
+            if self.bias_value == 0.0:
+                raise ValueError(
+                    "bias_value must be non-zero (a zero bias is a no-op)"
+                )
+        elif self.type == "drift":
+            if self.slope_per_second is None:
+                raise ValueError("drift fault requires 'slope_per_second'")
+        elif self.type == "stuck":
+            # No extra fields.
+            pass
+        elif self.type == "dropout":
+            if self.intervals is None or not self.intervals:
+                raise ValueError(
+                    "dropout fault requires a non-empty 'intervals' list"
+                )
+            for i, iv in enumerate(self.intervals):
+                if len(iv) != 2:
+                    raise ValueError(
+                        f"dropout intervals[{i}] must be a (start, end) pair"
+                    )
+                a, b = int(iv[0]), int(iv[1])
+                if b <= a:
+                    raise ValueError(
+                        f"dropout intervals[{i}] end ({b}) must be > start ({a})"
+                    )
+                if a < self.start_time_seconds or b > self.end_time_seconds:
+                    raise ValueError(
+                        f"dropout intervals[{i}] [{a}, {b}) is outside the fault "
+                        f"window [{self.start_time_seconds}, {self.end_time_seconds})"
+                    )
+        elif self.type == "noise":
+            if self.sigma is None:
+                raise ValueError("noise fault requires 'sigma'")
+            if self.sigma <= 0:
+                raise ValueError("sigma must be > 0")
+
+        return self
+
+
 class FaultsConfig(_Frozen):
     """Fault injection plan for one scenario.
 
     ``leaks`` is a list of typed :class:`LeakSpec` (Phase 3). Concurrent
     leaks are supported: each LeakSpec is independently realised on a
     fresh node inserted via ``wntr.morph.split_pipe``. ``sensor_faults``
-    remains a list of opaque dicts until Phase 4 introduces typed
-    submodels.
+    is a list of typed :class:`SensorFaultSpec` (Phase 4); concurrent
+    faults across distinct channels are supported.
     """
 
     leaks: list[LeakSpec] = Field(default_factory=list)
-    sensor_faults: list[dict] = Field(default_factory=list)
+    sensor_faults: list[SensorFaultSpec] = Field(default_factory=list)
 
 
 class ScenarioConfig(_Frozen):
@@ -293,17 +401,22 @@ class PipelineConfig(_Frozen):
 
     @model_validator(mode="after")
     def _validate_leak_invariants(self) -> PipelineConfig:
-        if not self.faults.leaks:
-            return self
-        if self.simulation.demand_model != "PDD":
-            raise ValueError(
-                "simulation.demand_model must be 'PDD' when faults.leaks is non-empty "
-                "(D16: explicit PDD requirement, no silent auto-promotion)"
-            )
-        for i, spec in enumerate(self.faults.leaks):
+        if self.faults.leaks:
+            if self.simulation.demand_model != "PDD":
+                raise ValueError(
+                    "simulation.demand_model must be 'PDD' when faults.leaks is non-empty "
+                    "(D16: explicit PDD requirement, no silent auto-promotion)"
+                )
+            for i, spec in enumerate(self.faults.leaks):
+                if spec.end_time_seconds > self.simulation.duration_seconds:
+                    raise ValueError(
+                        f"faults.leaks[{i}].end_time_seconds ({spec.end_time_seconds}) "
+                        f"exceeds simulation.duration_seconds ({self.simulation.duration_seconds})"
+                    )
+        for i, spec in enumerate(self.faults.sensor_faults):
             if spec.end_time_seconds > self.simulation.duration_seconds:
                 raise ValueError(
-                    f"faults.leaks[{i}].end_time_seconds ({spec.end_time_seconds}) "
+                    f"faults.sensor_faults[{i}].end_time_seconds ({spec.end_time_seconds}) "
                     f"exceeds simulation.duration_seconds ({self.simulation.duration_seconds})"
                 )
         return self

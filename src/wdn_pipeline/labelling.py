@@ -4,12 +4,16 @@ Two complementary artefacts (decision D10):
 
 - A per-timestep ``label`` column attached to the wide pressure / flow
   DataFrames at output time. ``0`` means normal, ``1`` means anomalous.
-  Current phase fills this in from leak windows; Next phase will extend it for
-  sensor-fault windows.
+  The label is the **union** of every active fault window: leak windows
+  from Phase 3 plus sensor-fault windows from Phase 4.
 - A sidecar metadata dictionary describing the full scenario (network,
   seed, scenario type, fault parameters, time window). The runner
   serialises this next to each output file.
 
+Per-channel masks (D22) are not stored in :class:`Labels` itself; the
+runner attaches them directly to the corresponding output table via
+:mod:`wdn_pipeline.output` to keep this module's responsibilities
+narrow.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import pandas as pd
 
 from wdn_pipeline.config import PipelineConfig
 from wdn_pipeline.faults.leak import ResolvedLeak
+from wdn_pipeline.faults.sensor import ResolvedSensorFault
 
 
 @dataclass(frozen=True)
@@ -49,11 +54,25 @@ def _leak_label_series(
     return labels
 
 
+def _apply_sensor_fault_windows(
+    labels: pd.Series, resolved_sensor_faults: Sequence[ResolvedSensorFault]
+) -> pd.Series:
+    if not resolved_sensor_faults:
+        return labels
+    times = labels.index.to_numpy()
+    for fault in resolved_sensor_faults:
+        # Same half-open convention as leaks.
+        mask = (times >= fault.start_time_seconds) & (times < fault.end_time_seconds)
+        labels.loc[mask] = 1
+    return labels
+
+
 def build_labels(
     config: PipelineConfig,
     time_index: pd.Index,
     network_name: str,
     resolved_leaks: Sequence[ResolvedLeak] | None = None,
+    resolved_sensor_faults: Sequence[ResolvedSensorFault] | None = None,
 ) -> Labels:
     """Build the per-timestep label series and the scenario metadata dict.
 
@@ -62,17 +81,25 @@ def build_labels(
         time_index: The simulation time index (seconds since start).
         network_name: Filename-safe network identifier.
         resolved_leaks: Concrete leak parameters realised by the leak
-            injector. ``None`` (or empty) means a no-leak run.
+            injector. ``None`` (or empty) means no leaks ran.
+        resolved_sensor_faults: Concrete sensor-fault parameters from
+            the sensor injector. ``None`` (or empty) means no sensor
+            faults ran.
 
     Returns:
-        :class:`Labels` with both artefacts. ``timestep_labels`` is ``1``
-        at every timestep covered by at least one leak window and ``0``
-        elsewhere; ``metadata`` includes the resolved leaks alongside
-        the original config summary.
+        :class:`Labels` with both artefacts. ``timestep_labels`` is
+        ``1`` at every timestep covered by at least one leak or sensor
+        fault window and ``0`` elsewhere; ``metadata`` includes the
+        resolved leaks and sensor faults alongside the original config
+        summary.
     """
 
     leaks = list(resolved_leaks) if resolved_leaks else []
+    sensor_faults = (
+        list(resolved_sensor_faults) if resolved_sensor_faults else []
+    )
     labels = _leak_label_series(time_index, leaks)
+    labels = _apply_sensor_fault_windows(labels, sensor_faults)
 
     metadata = {
         "scenario_type": config.scenario.type,
@@ -87,7 +114,7 @@ def build_labels(
         "demand_mode": config.demand.mode,
         "fault_summary": {
             "leaks": [leak.to_dict() for leak in leaks],
-            "sensor_faults": list(config.faults.sensor_faults),
+            "sensor_faults": [fault.to_dict() for fault in sensor_faults],
         },
     }
     return Labels(timestep_labels=labels, metadata=metadata)

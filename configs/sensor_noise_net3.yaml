@@ -1,0 +1,43 @@
+# Erratic noise fault on a Net3 pressure channel.
+# Junction "15"'s reported pressure is corrupted with additive Gaussian
+# noise of sigma=1.0 m for the entire 24-hour simulation. RNG offset is
+# fixed so reruns with the same seed produce identical samples.
+
+network:
+  inp_path: Net3
+  name: net3
+
+simulation:
+  duration_seconds: 86400          # 24 hours
+  hydraulic_timestep_seconds: 3600 # 1 hour
+  report_timestep_seconds: 3600
+  demand_model: DDA
+
+seed: 42
+
+demand:
+  mode: default
+
+scenario:
+  type: sensor_fault
+  label: sensor_noise
+
+faults:
+  sensor_faults:
+    - type: noise
+      quantity: pressure
+      target: "15"
+      sigma: 1.0               # metres
+      start_time_seconds: 0
+      end_time_seconds: 86400
+      rng_offset: 1
+      name: full_day_noise_node_15
+
+validation:
+  pressure_min_warning_tolerance_m: 5.0   # noise pushes nodes below the strict floor
+  pressure_max_m: 200.0
+
+output:
+  directory: outputs
+  formats: [parquet, csv]
+  write_metadata_sidecar: true

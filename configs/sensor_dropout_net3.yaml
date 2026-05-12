@@ -1,0 +1,45 @@
+# Sensor dropout fault on a Net3 pressure channel.
+# Three two-hour dropout windows (NaN-filled) on junction "15" between
+# 04:00 and the end of the day. The outer fault window covers all three
+# sub-intervals; samples outside the sub-intervals are unaffected.
+
+network:
+  inp_path: Net3
+  name: net3
+
+simulation:
+  duration_seconds: 86400          # 24 hours
+  hydraulic_timestep_seconds: 3600 # 1 hour
+  report_timestep_seconds: 3600
+  demand_model: DDA
+
+seed: 42
+
+demand:
+  mode: default
+
+scenario:
+  type: sensor_fault
+  label: sensor_dropout
+
+faults:
+  sensor_faults:
+    - type: dropout
+      quantity: pressure
+      target: "15"
+      start_time_seconds: 14400    # 04:00
+      end_time_seconds: 86400      # end of day
+      intervals:
+        - [14400, 21600]            # 04:00-06:00
+        - [36000, 43200]            # 10:00-12:00
+        - [64800, 72000]            # 18:00-20:00
+      fill_value: null              # NaN
+      name: triple_dropout_node_15
+
+validation:
+  pressure_min_warning_tolerance_m: 1.0
+
+output:
+  directory: outputs
+  formats: [parquet, csv]
+  write_metadata_sidecar: true
