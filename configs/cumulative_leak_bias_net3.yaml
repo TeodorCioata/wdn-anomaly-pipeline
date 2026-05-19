@@ -1,0 +1,54 @@
+# Cumulative scenario on Net3: an abrupt pipe leak plus a sensor bias.
+# The leak modifies the hydraulic model before simulation; the bias
+# corrupts junction "15"'s reported pressure after simulation. The two
+# fault families compose through the existing runner flow with no
+# special-case orchestration. The per-timestep label is the union of
+# both fault windows; per-fault-type masks stay separate.
+
+network:
+  inp_path: Net3
+  name: net3
+
+simulation:
+  duration_seconds: 86400          # 24 hours
+  hydraulic_timestep_seconds: 3600 # 1 hour
+  report_timestep_seconds: 3600
+  demand_model: PDD
+
+seed: 42
+
+demand:
+  mode: default
+
+scenario:
+  type: cumulative
+  label: cumulative_leak_bias
+
+faults:
+  leaks:
+    - pipe: "40"
+      split_fraction: 0.5
+      area_m2: 0.005
+      discharge_coeff: 0.75
+      start_time_seconds: 21600   # 06:00
+      end_time_seconds: 64800     # 18:00
+      profile: abrupt
+      name: midday_central_leak
+  sensor_faults:
+    - type: bias
+      quantity: pressure
+      target: "15"
+      bias_value: 2.0          # metres
+      start_time_seconds: 21600   # 06:00
+      end_time_seconds: 64800     # 18:00
+      name: midday_bias_node_15
+
+# The leak draws extra flow under PDD and amplifies the known Net3
+# node "10" dip; widen the warning floor so this stays a warning.
+validation:
+  pressure_min_warning_tolerance_m: 2.0
+
+output:
+  directory: outputs
+  formats: [parquet, csv]
+  write_metadata_sidecar: true

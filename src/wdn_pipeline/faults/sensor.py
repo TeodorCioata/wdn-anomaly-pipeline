@@ -8,7 +8,7 @@ returns a *new* :class:`SimulationResults` whose ``pressure`` and / or
 original simulator output is preserved verbatim in the ``pressure_clean``
 and ``flowrate_clean`` companion frames.
 
-Five strategies are implemented (D18):
+Six strategies are implemented (D18):
 
 - ``bias``: constant offset ``y'(t) = y(t) + bias_value``
 - ``drift``: linear ramp ``y'(t) = y(t) + slope * (t - start)``
@@ -16,6 +16,7 @@ Five strategies are implemented (D18):
 - ``dropout``: ``y'(t) = NaN`` (or ``fill_value``) on the configured
   sub-intervals
 - ``noise``: additive Gaussian ``y'(t) = y(t) + N(0, sigma**2)``
+- ``gain``: multiplicative factor ``y'(t) = gain_factor * y(t)``
 
 Every fault uses the half-open window convention ``[start, end)`` from
 Phase 3 leaks. RNG threading mirrors :mod:`wdn_pipeline.faults.leak`:
@@ -63,6 +64,8 @@ class ResolvedSensorFault:
         fill_value: Dropout fill (``None`` means NaN).
         sigma: Noise std (only meaningful for ``type == "noise"``).
         rng_offset: Offset used to seed the per-fault noise RNG.
+        gain_factor: Multiplicative factor (only meaningful for
+            ``type == "gain"``).
         name: Optional human-readable label.
     """
 
@@ -77,6 +80,7 @@ class ResolvedSensorFault:
     fill_value: float | None
     sigma: float | None
     rng_offset: int
+    gain_factor: float | None = None
     name: str | None = None
 
     def to_dict(self) -> dict:
@@ -201,6 +205,7 @@ class SensorFaultInjector:
                     fill_value=spec.fill_value,
                     sigma=spec.sigma,
                     rng_offset=int(spec.rng_offset),
+                    gain_factor=spec.gain_factor,
                     name=spec.name,
                 )
             )
@@ -341,6 +346,9 @@ class SensorFaultInjector:
             sub_rng = np.random.default_rng(seed)
             samples = sub_rng.normal(0.0, sigma, size=int(active.sum()))
             corrupted[active] = clean[active] + samples
+        elif spec.type == "gain":
+            gain = float(spec.gain_factor)  # type: ignore[arg-type]
+            corrupted[active] = clean[active] * gain
         else:
             raise ValueError(f"Unknown sensor fault type: {spec.type}")
 

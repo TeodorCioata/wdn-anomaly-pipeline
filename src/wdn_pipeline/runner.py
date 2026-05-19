@@ -37,9 +37,11 @@ from wdn_pipeline.output import (
     build_basename,
     write_outputs,
 )
+from wdn_pipeline.postprocess import remove_leak_artifacts
 from wdn_pipeline.simulation import SimulationResults, run_simulation
 from wdn_pipeline.validation import (
     ValidationReport,
+    validate_cumulative_scenario,
     validate_leak_scenario,
     validate_normal_scenario,
     validate_sensor_fault_scenario,
@@ -62,6 +64,7 @@ class RunSummary:
     validation: ValidationReport
     resolved_leaks: list[ResolvedLeak]
     resolved_sensor_faults: list[ResolvedSensorFault] = field(default_factory=list)
+    interactions: list[dict] = field(default_factory=list)
 
     def format(self) -> str:
         lines = [
@@ -89,6 +92,15 @@ class RunSummary:
                 lines.append(
                     f"  [{i}] type={f.type} quantity={f.quantity} target={f.target} "
                     f"window=[{f.start_time_seconds},{f.end_time_seconds})s"
+                )
+        if self.interactions:
+            lines.append(
+                f"interactions    : {len(self.interactions)} (informational)"
+            )
+            for i, it in enumerate(self.interactions):
+                lines.append(
+                    f"  [{i}] {it['kind']}: sensor target {it['sensor_target']} "
+                    f"coincides with leak node {it['leak_node']}"
                 )
         lines.append(self.validation.format())
         return "\n".join(lines)
@@ -156,8 +168,26 @@ def run(config: PipelineConfig) -> RunSummary:
         resolved_sensor_faults,
     )
 
+    interactions = labels.metadata.get("fault_summary", {}).get("interactions", [])
+    if interactions:
+        logger.info(
+            "Cumulative interaction(s) recorded (informational): %s",
+            "; ".join(
+                f"{it['kind']} on {it['sensor_target']}" for it in interactions
+            ),
+        )
+
     logger.info("Validating outputs")
-    if resolved_sensor_faults:
+    if resolved_leaks and resolved_sensor_faults:
+        report = validate_cumulative_scenario(
+            wn,
+            results,
+            resolved_leaks,
+            resolved_sensor_faults,
+            sensor_masks,
+            config.validation,
+        )
+    elif resolved_sensor_faults:
         report = validate_sensor_fault_scenario(
             wn, results, resolved_sensor_faults, sensor_masks, config.validation
         )
@@ -169,6 +199,17 @@ def run(config: PipelineConfig) -> RunSummary:
 
     basename = build_basename(network_name, config.scenario.label, config.seed)
     tables = assemble_tables(results, labels, sensor_masks)
+
+    if config.output.remove_leak_nodes:
+        if resolved_leaks:
+            logger.info(
+                "Reverting leak-node split artefacts (output.remove_leak_nodes)"
+            )
+            tables = remove_leak_artifacts(tables, resolved_leaks)
+        else:
+            logger.info(
+                "output.remove_leak_nodes set but no leaks injected; cleanup is a no-op"
+            )
 
     logger.info("Writing outputs to %s", config.output.directory)
     write_result: WriteResult = write_outputs(
@@ -191,6 +232,7 @@ def run(config: PipelineConfig) -> RunSummary:
         validation=report,
         resolved_leaks=resolved_leaks,
         resolved_sensor_faults=resolved_sensor_faults,
+        interactions=interactions,
     )
 
 

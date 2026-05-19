@@ -67,6 +67,52 @@ def _apply_sensor_fault_windows(
     return labels
 
 
+def _detect_interactions(
+    resolved_leaks: Sequence[ResolvedLeak],
+    resolved_sensor_faults: Sequence[ResolvedSensorFault],
+) -> list[dict]:
+    """Record cumulative interactions where a sensor fault sits on a leak.
+
+    An interaction is a sensor fault whose target channel coincides with
+    a leak's hydraulic footprint:
+
+    - a ``pressure`` fault on the inserted leak junction, or
+    - a ``flowrate`` fault on either segment of the split pipe.
+
+    The result is **informational only** (decision D24 / Week 5 plan):
+    it is surfaced in the sidecar metadata so a downstream consumer can
+    see that the leak signature and the sensor fault overlap on the same
+    channel, but it never gates the pipeline. The structural leak check
+    ``leak_demand_active`` reads from the uncorrupted ``leak_demand``
+    table, so leak correctness is unaffected by the overlap.
+    """
+
+    interactions: list[dict] = []
+    for fault in resolved_sensor_faults:
+        for leak in resolved_leaks:
+            shared: str | None = None
+            if fault.quantity == "pressure" and fault.target == leak.leak_node_name:
+                shared = "pressure_sensor_on_leak_node"
+            elif fault.quantity == "flowrate" and fault.target in (
+                leak.pipe,
+                leak.new_pipe_name,
+            ):
+                shared = "flowrate_sensor_on_leaked_pipe"
+            if shared is not None:
+                interactions.append(
+                    {
+                        "kind": shared,
+                        "leak_node": leak.leak_node_name,
+                        "leak_pipe": leak.pipe,
+                        "leak_name": leak.name,
+                        "sensor_fault_type": fault.type,
+                        "sensor_target": fault.target,
+                        "sensor_fault_name": fault.name,
+                    }
+                )
+    return interactions
+
+
 def build_labels(
     config: PipelineConfig,
     time_index: pd.Index,
@@ -115,6 +161,7 @@ def build_labels(
         "fault_summary": {
             "leaks": [leak.to_dict() for leak in leaks],
             "sensor_faults": [fault.to_dict() for fault in sensor_faults],
+            "interactions": _detect_interactions(leaks, sensor_faults),
         },
     }
     return Labels(timestep_labels=labels, metadata=metadata)

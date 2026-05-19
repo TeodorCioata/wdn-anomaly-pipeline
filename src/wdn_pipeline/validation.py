@@ -399,14 +399,23 @@ def _check_sensor_fault_mask_consistent(
 def _check_sensor_fault_signal_applied(
     results: SimulationResults,
     resolved_faults: Sequence[ResolvedSensorFault],
+    cfg: ValidationConfig,
 ) -> ValidationCheck:
     """Structural check: corrupted minus clean matches the spec formula.
 
-    Bias / drift / stuck / dropout are exact comparisons (up to
+    Bias / drift / stuck / dropout / gain are exact comparisons (up to
     floating-point tolerance). Noise is validated statistically: the
     residual must have near-zero mean (within ``4*sigma/sqrt(n)``) and
     its sample std must be near sigma (relative tolerance 30% to absorb
     small samples, default for Net3's 24-hour 1-hour-step grid).
+
+    The gain fault adds a non-structural detectability check (D27): if
+    the residual standard deviation is below
+    ``cfg.gain_detectability_min_ratio`` times the clean-signal standard
+    deviation the fault may be statistically indistinguishable from
+    sensor noise. That emits a **warning** (never a hard failure), so
+    this check's overall severity is ``fail`` on any structural issue,
+    ``warning`` on a detectability concern and ``ok`` otherwise.
     """
 
     if not resolved_faults:
@@ -415,6 +424,7 @@ def _check_sensor_fault_signal_applied(
         )
 
     issues: list[str] = []
+    soft_issues: list[str] = []
     summaries: list[str] = []
     for fault in resolved_faults:
         if fault.quantity == "pressure":
@@ -558,13 +568,58 @@ def _check_sensor_fault_signal_applied(
                     f"noise@{fault.target}: residual std {std:.3f} deviates from "
                     f"sigma {sigma:.3f} by more than {std_tol:.3f}"
                 )
+        elif fault.type == "gain":
+            gain = float(fault.gain_factor)  # type: ignore[arg-type]
+            inside_clean = clean[active]
+            inside_corrupted = corrupted[active]
+            expected = gain * inside_clean
+            max_err = (
+                float(np.max(np.abs(inside_corrupted - expected)))
+                if inside_clean.size
+                else 0.0
+            )
+            # Structural check: corrupted == gain_factor * clean exactly.
+            if max_err > 1e-9:
+                issues.append(
+                    f"gain@{fault.target}: residual deviates from "
+                    f"gain_factor * clean (max_err={max_err:.3e})"
+                )
+            # Detectability check (D27): the residual std must be a large
+            # enough fraction of the clean-signal std. For a pure gain
+            # the residual is (gain - 1) * clean, so this ratio collapses
+            # to |gain - 1|; phrasing it as a std ratio keeps the check
+            # robust if the gain strategy is ever generalised.
+            residual = inside_corrupted - inside_clean
+            clean_std = (
+                float(np.std(inside_clean, ddof=0))
+                if inside_clean.size > 1
+                else 0.0
+            )
+            res_std = (
+                float(np.std(residual, ddof=0)) if residual.size > 1 else 0.0
+            )
+            ratio = res_std / clean_std if clean_std > 1e-12 else float("inf")
+            summaries.append(
+                f"gain@{fault.target}: factor={gain:.4f} n_active={int(active.sum())} "
+                f"max_err={max_err:.3e} detectability_ratio={ratio:.3f}"
+            )
+            if ratio < cfg.gain_detectability_min_ratio:
+                soft_issues.append(
+                    f"gain@{fault.target} may be undetectable: residual std is "
+                    f"{ratio * 100:.2f}% of clean signal std "
+                    f"(min {cfg.gain_detectability_min_ratio * 100:.2f}%)"
+                )
         else:
             issues.append(f"unknown sensor fault type: {fault.type}")
 
-    severity: Severity = "fail" if issues else "ok"
+    severity: Severity = (
+        "fail" if issues else ("warning" if soft_issues else "ok")
+    )
     detail = "; ".join(summaries) if summaries else "no checks executed"
     if issues:
         detail += " | " + "; ".join(issues)
+    if soft_issues:
+        detail += " | " + "; ".join(soft_issues)
     return ValidationCheck("sensor_fault_signal_applied", severity, detail)
 
 
@@ -664,7 +719,77 @@ def validate_sensor_fault_scenario(
             _check_sensor_fault_mask_consistent(
                 results, resolved_sensor_faults, masks
             ),
-            _check_sensor_fault_signal_applied(results, resolved_sensor_faults),
+            _check_sensor_fault_signal_applied(
+                results, resolved_sensor_faults, cfg
+            ),
+        ]
+    )
+
+
+def validate_cumulative_scenario(
+    wn: WaterNetworkModel,
+    results: SimulationResults,
+    resolved_leaks: Sequence[ResolvedLeak],
+    resolved_sensor_faults: Sequence[ResolvedSensorFault],
+    masks: dict[str, pd.Series],
+    cfg: ValidationConfig,
+) -> ValidationReport:
+    """Run every leak-specific and sensor-fault check for a cumulative scenario.
+
+    A cumulative scenario carries both leaks and sensor faults. The two
+    fault families are validated independently, exactly as they would be
+    in isolation, because they never interact in the hydraulic model:
+
+    - The hydraulic checks (``finite_values``, ``mass_balance``,
+      ``leak_demand_active``, ``leak_pressure_drop``) run on the
+      **clean** signal frames. ``pressure_clean`` and ``flowrate_clean``
+      carry the leak-affected but sensor-uncorrupted simulator output,
+      so a sensor fault sitting on the leak junction cannot mask the
+      leak's hydraulic signature here.
+    - ``pressure_bounds`` runs on the corrupted signal (unless dropout
+      faults are present, where NaN is the correct output): the bounds
+      check describes what the downstream consumer actually receives.
+    - The two structural sensor-fault checks run on the corrupted
+      frames as usual.
+    """
+
+    clean_results = SimulationResults(
+        pressure=results.pressure_clean,
+        flowrate=results.flowrate_clean,
+        demand=results.demand,
+        leak_demand=results.leak_demand,
+        elapsed_seconds=results.elapsed_seconds,
+        pressure_clean=results.pressure_clean,
+        flowrate_clean=results.flowrate_clean,
+    )
+
+    has_dropout = any(f.type == "dropout" for f in resolved_sensor_faults)
+    if has_dropout:
+        finite_check = _check_finite(clean_results)
+        finite_check = ValidationCheck(
+            name=finite_check.name,
+            severity=finite_check.severity,
+            detail="(clean signals only; dropout NaNs are expected) "
+            + finite_check.detail,
+        )
+        bounds_check = _check_pressure_bounds(clean_results, cfg)
+    else:
+        finite_check = _check_finite(results)
+        bounds_check = _check_pressure_bounds(results, cfg)
+
+    return ValidationReport(
+        checks=[
+            finite_check,
+            bounds_check,
+            _check_mass_balance(wn, clean_results, cfg),
+            _check_leak_demand_active(clean_results, resolved_leaks),
+            _check_leak_pressure_drop(clean_results, resolved_leaks, cfg),
+            _check_sensor_fault_mask_consistent(
+                results, resolved_sensor_faults, masks
+            ),
+            _check_sensor_fault_signal_applied(
+                results, resolved_sensor_faults, cfg
+            ),
         ]
     )
 

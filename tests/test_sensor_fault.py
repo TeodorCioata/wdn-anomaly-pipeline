@@ -865,3 +865,173 @@ def test_run_from_yaml_config(tmp_path: Path) -> None:
     summary = run_from_config_file(cfg_path)
     assert summary.validation.passed
     assert len(summary.resolved_sensor_faults) == 1
+
+
+# ---------------------------------------------------------------------------
+# Gain fault (Week 5, D27)
+# ---------------------------------------------------------------------------
+
+
+def test_gain_spec_requires_gain_factor() -> None:
+    with pytest.raises(ValidationError, match="gain_factor"):
+        SensorFaultSpec(
+            type="gain",
+            target="15",
+            start_time_seconds=0,
+            end_time_seconds=3600,
+        )
+
+
+def test_gain_spec_rejects_unit_gain() -> None:
+    with pytest.raises(ValidationError, match="no-op"):
+        SensorFaultSpec(
+            type="gain",
+            target="15",
+            gain_factor=1.0,
+            start_time_seconds=0,
+            end_time_seconds=3600,
+        )
+
+
+def test_gain_spec_rejects_zero_gain() -> None:
+    with pytest.raises(ValidationError, match="zero gain"):
+        SensorFaultSpec(
+            type="gain",
+            target="15",
+            gain_factor=0.0,
+            start_time_seconds=0,
+            end_time_seconds=3600,
+        )
+
+
+def test_gain_applies_multiplicative_factor_in_window() -> None:
+    results = _build_fake_results()
+    spec = SensorFaultSpec(
+        type="gain",
+        target="a",
+        gain_factor=1.2,
+        start_time_seconds=7200,
+        end_time_seconds=21600,
+    )
+    out = SensorFaultInjector().apply(results, [spec], np.random.default_rng(0))
+    times = out.results.pressure.index.to_numpy()
+    inside = (times >= 7200) & (times < 21600)
+    clean = results.pressure_clean["a"].to_numpy()
+    corrupted = out.results.pressure["a"].to_numpy()
+    assert np.allclose(corrupted[inside], 1.2 * clean[inside])
+    assert np.allclose(corrupted[~inside], clean[~inside])
+
+
+def test_gain_deterministic_for_same_seed() -> None:
+    results = _build_fake_results()
+    spec = SensorFaultSpec(
+        type="gain",
+        target="a",
+        gain_factor=0.85,
+        start_time_seconds=0,
+        end_time_seconds=86400,
+    )
+    out1 = SensorFaultInjector().apply(results, [spec], np.random.default_rng(0))
+    out2 = SensorFaultInjector().apply(results, [spec], np.random.default_rng(0))
+    pd.testing.assert_frame_equal(out1.results.pressure, out2.results.pressure)
+
+
+def test_gain_resolved_records_factor() -> None:
+    results = _build_fake_results()
+    spec = SensorFaultSpec(
+        type="gain",
+        target="a",
+        gain_factor=1.15,
+        start_time_seconds=0,
+        end_time_seconds=86400,
+    )
+    out = SensorFaultInjector().apply(results, [spec], np.random.default_rng(0))
+    assert out.resolved[0].gain_factor == pytest.approx(1.15)
+
+
+def test_gain_config_end_to_end(tmp_path: Path) -> None:
+    """The shipped sensor_gain_net3 config runs and validators pass."""
+
+    yaml_path = REPO_ROOT / "configs" / "sensor_gain_net3.yaml"
+    raw = yaml.safe_load(yaml_path.read_text())
+    raw["output"]["directory"] = str(tmp_path / "outputs")
+    cfg = PipelineConfig.model_validate(raw)
+    summary = run(cfg)
+    mc = next(
+        c
+        for c in summary.validation.checks
+        if c.name == "sensor_fault_mask_consistent"
+    )
+    sa = next(
+        c
+        for c in summary.validation.checks
+        if c.name == "sensor_fault_signal_applied"
+    )
+    assert mc.severity == "ok"
+    # A 10% gain is well above the 5% detectability floor.
+    assert sa.severity == "ok"
+
+
+def test_gain_detectability_warning_for_small_gain() -> None:
+    """A gain factor very close to 1.0 triggers the D27 detectability warning."""
+
+    from wdn_pipeline.config import ValidationConfig
+
+    sim_cfg = SimulationConfig(
+        duration_seconds=24 * 3600,
+        hydraulic_timestep_seconds=3600,
+        report_timestep_seconds=3600,
+    )
+    wn = load_network(NetworkConfig(inp_path="Net3"), sim_cfg)
+    results = run_simulation(wn)
+    spec = SensorFaultSpec(
+        type="gain",
+        target="15",
+        gain_factor=1.001,
+        start_time_seconds=0,
+        end_time_seconds=86400,
+    )
+    out = SensorFaultInjector().apply(
+        results, [spec], np.random.default_rng(0), wn=wn
+    )
+    report = validate_sensor_fault_scenario(
+        wn, out.results, out.resolved, out.masks, ValidationConfig()
+    )
+    sa = next(
+        c for c in report.checks if c.name == "sensor_fault_signal_applied"
+    )
+    # Structural part still holds (corrupted == gain * clean), so this is
+    # a warning, not a fail.
+    assert sa.severity == "warning"
+    assert "undetectable" in sa.detail
+
+
+def test_gain_detectability_ok_for_large_gain() -> None:
+    """A clearly detectable gain leaves signal_applied at ok."""
+
+    from wdn_pipeline.config import ValidationConfig
+
+    sim_cfg = SimulationConfig(
+        duration_seconds=24 * 3600,
+        hydraulic_timestep_seconds=3600,
+        report_timestep_seconds=3600,
+    )
+    wn = load_network(NetworkConfig(inp_path="Net3"), sim_cfg)
+    results = run_simulation(wn)
+    spec = SensorFaultSpec(
+        type="gain",
+        target="15",
+        gain_factor=1.25,
+        start_time_seconds=0,
+        end_time_seconds=86400,
+    )
+    out = SensorFaultInjector().apply(
+        results, [spec], np.random.default_rng(0), wn=wn
+    )
+    report = validate_sensor_fault_scenario(
+        wn, out.results, out.resolved, out.masks, ValidationConfig()
+    )
+    sa = next(
+        c for c in report.checks if c.name == "sensor_fault_signal_applied"
+    )
+    assert sa.severity == "ok"

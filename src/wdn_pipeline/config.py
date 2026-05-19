@@ -191,15 +191,15 @@ class SensorFaultSpec(_Frozen):
 
     Sensor faults are applied **post-simulation** (D5): they corrupt the
     reported pressure or flowrate at a single channel without modifying
-    the hydraulic model. Five fault types are supported, discriminated
+    the hydraulic model. Six fault types are supported, discriminated
     by ``type``. Each fault uses the half-open window convention
     ``[start_time_seconds, end_time_seconds)`` consistent with Phase 3
     leaks.
 
     Attributes:
         type: One of ``bias`` / ``drift`` / ``stuck`` / ``dropout`` /
-            ``noise``. Acts as the type discriminator for downstream
-            dispatch in :mod:`wdn_pipeline.faults.sensor`.
+            ``noise`` / ``gain``. Acts as the type discriminator for
+            downstream dispatch in :mod:`wdn_pipeline.faults.sensor`.
         quantity: Which output table to corrupt. ``pressure`` targets
             a junction; ``flowrate`` targets a pipe.
         target: Channel name (junction for pressure, link for flowrate)
@@ -228,9 +228,14 @@ class SensorFaultSpec(_Frozen):
         rng_offset: Optional per-fault offset for the noise RNG. Lets
             two ``noise`` faults in the same scenario draw independent
             sample streams without changing the scenario seed.
+        gain_factor: Multiplicative factor for the ``gain`` fault
+            (``y'(t) = gain_factor * y(t)``). A factor of ``1.0`` is a
+            no-op and ``0.0`` zeroes the signal; both are rejected as
+            likely config mistakes. Detectability of small gains is
+            checked at runtime (D27).
     """
 
-    type: Literal["bias", "drift", "stuck", "dropout", "noise"]
+    type: Literal["bias", "drift", "stuck", "dropout", "noise", "gain"]
     quantity: Literal["pressure", "flowrate"] = "pressure"
     target: str | None = None
     start_time_seconds: Annotated[int, Field(ge=0)]
@@ -246,6 +251,7 @@ class SensorFaultSpec(_Frozen):
     fill_value: float | None = None
     sigma: float | None = None
     rng_offset: int = 0
+    gain_factor: float | None = None
 
     @model_validator(mode="after")
     def _validate_sensor_fault(self) -> SensorFaultSpec:
@@ -290,6 +296,17 @@ class SensorFaultSpec(_Frozen):
                 raise ValueError("noise fault requires 'sigma'")
             if self.sigma <= 0:
                 raise ValueError("sigma must be > 0")
+        elif self.type == "gain":
+            if self.gain_factor is None:
+                raise ValueError("gain fault requires 'gain_factor'")
+            if self.gain_factor == 1.0:
+                raise ValueError(
+                    "gain_factor must not be 1.0 (a unit gain is a no-op)"
+                )
+            if self.gain_factor == 0.0:
+                raise ValueError(
+                    "gain_factor must not be 0.0 (a zero gain zeroes the signal)"
+                )
 
         return self
 
@@ -330,11 +347,18 @@ class OutputConfig(_Frozen):
             (e.g. DuckDB) without changes to this schema.
         write_metadata_sidecar: When true a ``.meta.yaml`` file is
             written next to each data file describing the scenario.
+        remove_leak_nodes: When true a post-processing step (D28) reverts
+            the leak-node split artefacts before serialisation: leak-node
+            columns are dropped and split pipe segments are collapsed
+            back to the original pipe name so the output schema matches
+            the original network. Default false (explicit opt-in). The
+            ``leak_demand`` diagnostic table is never affected.
     """
 
     directory: Path = Path("outputs")
     formats: list[Literal["parquet", "csv"]] = Field(default_factory=lambda: ["parquet", "csv"])
     write_metadata_sidecar: bool = True
+    remove_leak_nodes: bool = False
 
     @model_validator(mode="after")
     def _validate_formats(self) -> OutputConfig:
@@ -374,6 +398,14 @@ class ValidationConfig(_Frozen):
             to register as a clear pressure response. If the observed
             drop is smaller the leak-pressure-drop check fires a
             warning (never a hard failure).
+        gain_detectability_min_ratio: Minimum ratio of the gain-fault
+            residual standard deviation to the clean-signal standard
+            deviation for the fault to be considered detectable (D27).
+            Below this ratio the ``sensor_fault_signal_applied`` check
+            emits a warning (never a hard failure): a small gain on a
+            low-variance channel is statistically indistinguishable
+            from normal sensor noise and would mislabel ML training
+            data.
     """
 
     pressure_min_m: float = 0.0
@@ -381,6 +413,7 @@ class ValidationConfig(_Frozen):
     pressure_max_m: Annotated[float, Field(gt=0)] = 150.0
     mass_balance_tol_m3s: Annotated[float, Field(gt=0)] = 1e-3
     leak_pressure_drop_min_m: Annotated[float, Field(ge=0)] = 0.01
+    gain_detectability_min_ratio: Annotated[float, Field(ge=0)] = 0.05
 
 
 class PipelineConfig(_Frozen):
