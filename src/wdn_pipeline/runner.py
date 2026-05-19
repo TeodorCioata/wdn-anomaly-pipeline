@@ -2,7 +2,8 @@
 
 Pipeline order::
 
-    config -> network -> demand -> simulation -> validation -> labels -> output
+    config -> network -> demand -> [leak injection] -> simulation
+           -> [sensor fault injection] -> validation -> labels -> output
 
 Both a Python entry point (:func:`run_from_config_file`) and a Typer
 CLI are exposed. The CLI is registered as the ``wdn-pipeline`` console
@@ -13,15 +14,21 @@ from __future__ import annotations
 
 import logging
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated
 
 import numpy as np
+import pandas as pd
 import typer
 
 from wdn_pipeline.config import PipelineConfig, load_config
 from wdn_pipeline.demand import apply_demand
+from wdn_pipeline.faults.leak import LeakInjector, ResolvedLeak
+from wdn_pipeline.faults.sensor import (
+    ResolvedSensorFault,
+    SensorFaultInjector,
+)
 from wdn_pipeline.labelling import build_labels
 from wdn_pipeline.network import derive_network_name, load_network
 from wdn_pipeline.output import (
@@ -30,8 +37,15 @@ from wdn_pipeline.output import (
     build_basename,
     write_outputs,
 )
+from wdn_pipeline.postprocess import remove_leak_artifacts
 from wdn_pipeline.simulation import SimulationResults, run_simulation
-from wdn_pipeline.validation import ValidationReport, validate_normal_scenario
+from wdn_pipeline.validation import (
+    ValidationReport,
+    validate_cumulative_scenario,
+    validate_leak_scenario,
+    validate_normal_scenario,
+    validate_sensor_fault_scenario,
+)
 
 logger = logging.getLogger("wdn_pipeline.runner")
 
@@ -48,6 +62,9 @@ class RunSummary:
     output_paths: list[Path]
     metadata_path: Path | None
     validation: ValidationReport
+    resolved_leaks: list[ResolvedLeak]
+    resolved_sensor_faults: list[ResolvedSensorFault] = field(default_factory=list)
+    interactions: list[dict] = field(default_factory=list)
 
     def format(self) -> str:
         lines = [
@@ -58,8 +75,34 @@ class RunSummary:
             f"elapsed_seconds : {self.elapsed_seconds:.3f}",
             f"output_paths    : {[str(p) for p in self.output_paths]}",
             f"metadata_path   : {self.metadata_path}",
-            self.validation.format(),
         ]
+        if self.resolved_leaks:
+            lines.append(f"resolved_leaks  : {len(self.resolved_leaks)}")
+            for i, leak in enumerate(self.resolved_leaks):
+                lines.append(
+                    f"  [{i}] pipe={leak.pipe} split={leak.split_fraction:.3f} "
+                    f"area={leak.area_m2:.3e} m^2 profile={leak.profile} "
+                    f"window=[{leak.start_time_seconds},{leak.end_time_seconds}]s"
+                )
+        if self.resolved_sensor_faults:
+            lines.append(
+                f"resolved_sensors: {len(self.resolved_sensor_faults)}"
+            )
+            for i, f in enumerate(self.resolved_sensor_faults):
+                lines.append(
+                    f"  [{i}] type={f.type} quantity={f.quantity} target={f.target} "
+                    f"window=[{f.start_time_seconds},{f.end_time_seconds})s"
+                )
+        if self.interactions:
+            lines.append(
+                f"interactions    : {len(self.interactions)} (informational)"
+            )
+            for i, it in enumerate(self.interactions):
+                lines.append(
+                    f"  [{i}] {it['kind']}: sensor target {it['sensor_target']} "
+                    f"coincides with leak node {it['leak_node']}"
+                )
+        lines.append(self.validation.format())
         return "\n".join(lines)
 
 
@@ -88,19 +131,85 @@ def run(config: PipelineConfig) -> RunSummary:
     logger.info("Applying demand strategy: %s", config.demand.mode)
     apply_demand(wn, config.demand, config.seed)
 
+    # Single RNG drives both leak and sensor-fault randomness. Order
+    # matters: leaks resolve first (they may modify the model that
+    # the sensor injector picks targets from), then sensors.
+    rng = np.random.default_rng(config.seed)
+
+    if config.faults.leaks:
+        logger.info("Injecting %d leak(s)", len(config.faults.leaks))
+        resolved_leaks = LeakInjector().apply(wn, list(config.faults.leaks), rng)
+    else:
+        resolved_leaks = []
+
     logger.info("Running WNTR simulation")
     results: SimulationResults = run_simulation(wn)
     logger.info("Simulation finished in %.3fs", results.elapsed_seconds)
 
+    sensor_masks: dict[str, pd.Series] = {}
+    resolved_sensor_faults: list[ResolvedSensorFault] = []
+    if config.faults.sensor_faults:
+        logger.info(
+            "Injecting %d sensor fault(s)", len(config.faults.sensor_faults)
+        )
+        sensor_result = SensorFaultInjector().apply(
+            results, list(config.faults.sensor_faults), rng, wn
+        )
+        results = sensor_result.results
+        resolved_sensor_faults = sensor_result.resolved
+        sensor_masks = sensor_result.masks
+
     logger.info("Building labels")
-    labels = build_labels(config, results.pressure.index, network_name)
+    labels = build_labels(
+        config,
+        results.pressure.index,
+        network_name,
+        resolved_leaks,
+        resolved_sensor_faults,
+    )
+
+    interactions = labels.metadata.get("fault_summary", {}).get("interactions", [])
+    if interactions:
+        logger.info(
+            "Cumulative interaction(s) recorded (informational): %s",
+            "; ".join(
+                f"{it['kind']} on {it['sensor_target']}" for it in interactions
+            ),
+        )
 
     logger.info("Validating outputs")
-    report = validate_normal_scenario(wn, results, config.validation)
+    if resolved_leaks and resolved_sensor_faults:
+        report = validate_cumulative_scenario(
+            wn,
+            results,
+            resolved_leaks,
+            resolved_sensor_faults,
+            sensor_masks,
+            config.validation,
+        )
+    elif resolved_sensor_faults:
+        report = validate_sensor_fault_scenario(
+            wn, results, resolved_sensor_faults, sensor_masks, config.validation
+        )
+    elif resolved_leaks:
+        report = validate_leak_scenario(wn, results, resolved_leaks, config.validation)
+    else:
+        report = validate_normal_scenario(wn, results, config.validation)
     logger.info("Validation severity: %s", report.severity.upper())
 
     basename = build_basename(network_name, config.scenario.label, config.seed)
-    tables = assemble_tables(results, labels)
+    tables = assemble_tables(results, labels, sensor_masks)
+
+    if config.output.remove_leak_nodes:
+        if resolved_leaks:
+            logger.info(
+                "Reverting leak-node split artefacts (output.remove_leak_nodes)"
+            )
+            tables = remove_leak_artifacts(tables, resolved_leaks)
+        else:
+            logger.info(
+                "output.remove_leak_nodes set but no leaks injected; cleanup is a no-op"
+            )
 
     logger.info("Writing outputs to %s", config.output.directory)
     write_result: WriteResult = write_outputs(
@@ -121,6 +230,9 @@ def run(config: PipelineConfig) -> RunSummary:
         output_paths=write_result.data_paths,
         metadata_path=write_result.metadata_path,
         validation=report,
+        resolved_leaks=resolved_leaks,
+        resolved_sensor_faults=resolved_sensor_faults,
+        interactions=interactions,
     )
 
 

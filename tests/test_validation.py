@@ -32,14 +32,31 @@ def net3_results() -> tuple:
 def _fake_results(pressure: pd.DataFrame) -> SimulationResults:
     flow = pd.DataFrame(0.0, index=pressure.index, columns=["L1"])
     demand = pd.DataFrame(0.0, index=pressure.index, columns=pressure.columns)
-    return SimulationResults(pressure=pressure, flowrate=flow, demand=demand, elapsed_seconds=0.0)
+    leak = pd.DataFrame(0.0, index=pressure.index, columns=pressure.columns)
+    return SimulationResults(
+        pressure=pressure,
+        flowrate=flow,
+        demand=demand,
+        leak_demand=leak,
+        elapsed_seconds=0.0,
+        pressure_clean=pressure.copy(),
+        flowrate_clean=flow.copy(),
+    )
 
 
 def test_check_finite_fails_on_nan(net3_results) -> None:
     wn, results = net3_results
     p = results.pressure.copy()
     p.iloc[0, 0] = np.nan
-    bad = SimulationResults(p, results.flowrate, results.demand, results.elapsed_seconds)
+    bad = SimulationResults(
+        pressure=p,
+        flowrate=results.flowrate,
+        demand=results.demand,
+        leak_demand=results.leak_demand,
+        elapsed_seconds=results.elapsed_seconds,
+        pressure_clean=p.copy(),
+        flowrate_clean=results.flowrate_clean,
+    )
     report = validate_normal_scenario(wn, bad, ValidationConfig())
     fin = next(c for c in report.checks if c.name == "finite_values")
     assert fin.severity == "fail"

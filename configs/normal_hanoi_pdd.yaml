@@ -1,0 +1,35 @@
+# Normal scenario on Hanoi under PDD (24h, 1h timestep).
+# Hanoi.inp ships with no demand patterns and duration=0; the pipeline
+# overrides duration here and uses the synthetic Fourier demand mode.
+# PDD is the project default from Week 5 onwards.
+
+network:
+  inp_path: networks/Hanoi.inp
+  name: hanoi
+
+simulation:
+  duration_seconds: 86400          # 24 hours
+  hydraulic_timestep_seconds: 3600 # 1 hour
+  report_timestep_seconds: 3600
+  pattern_timestep_seconds: 3600
+  demand_model: PDD
+
+seed: 7
+
+demand:
+  mode: fourier
+  fourier:
+    base: 1.0
+    amplitude: 0.3
+    period_hours: 24.0
+    phase_shift_hours: 6.0
+    noise_std: 0.0
+
+scenario:
+  type: normal
+  label: normal_pdd
+
+output:
+  directory: outputs
+  formats: [parquet, csv]
+  write_metadata_sidecar: true

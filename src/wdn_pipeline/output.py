@@ -32,8 +32,21 @@ import yaml
 from wdn_pipeline.labelling import Labels
 from wdn_pipeline.simulation import SimulationResults
 
-# Names of the data tables we serialise per scenario.
-TABLE_NAMES = ("pressure", "flowrate", "demand")
+# Names of the data tables we serialise per scenario. ``leak_demand`` is
+# included unconditionally; for no-leak runs it is a zero frame matching
+# the pressure shape (see :class:`SimulationResults`). ``pressure_clean``
+# and ``flowrate_clean`` always carry the uncorrupted simulator output
+# (Phase 4): they equal the corrupted siblings element-for-element when
+# no sensor faults run, but the downstream ML consumer reads them as
+# the ground truth in cumulative scenarios.
+TABLE_NAMES = (
+    "pressure",
+    "flowrate",
+    "demand",
+    "leak_demand",
+    "pressure_clean",
+    "flowrate_clean",
+)
 
 
 @dataclass(frozen=True)
@@ -138,11 +151,23 @@ def build_basename(network_name: str, scenario_label: str, seed: int) -> str:
     return f"{safe_network}_{safe_label}_{seed}"
 
 
-def assemble_tables(results: SimulationResults, labels: Labels) -> dict[str, pd.DataFrame]:
+def assemble_tables(
+    results: SimulationResults,
+    labels: Labels,
+    sensor_masks: dict[str, pd.Series] | None = None,
+) -> dict[str, pd.DataFrame]:
     """Attach the per-timestep label column to every table.
 
     The label is the same column repeated across pressure / flowrate /
     demand to make every table independently filterable.
+
+    Per-channel sensor-fault masks (D22, D26) are appended to the
+    matching corrupted table: a pressure fault's mask column is added
+    to ``pressure``, a flowrate fault's mask is added to ``flowrate``.
+    Mask column names follow ``{fault_type}_mask_{target}``. The
+    clean-signal tables and the demand / leak_demand tables do not
+    carry mask columns: a downstream consumer reading the clean tables
+    cares about ground truth only.
     """
 
     out: dict[str, pd.DataFrame] = {}
@@ -151,6 +176,29 @@ def assemble_tables(results: SimulationResults, labels: Labels) -> dict[str, pd.
         # The label series is indexed identically to the simulation tables.
         df["label"] = labels.timestep_labels.reindex(df.index).fillna(0).astype("int8")
         out[name] = df
+
+    if sensor_masks:
+        for mask_name, mask_series in sensor_masks.items():
+            # Names follow {type}_mask_{target}. We dispatch to the
+            # right corrupted table by checking which column the target
+            # belongs to. The target may equal a column name in both
+            # tables in pathological topologies, but the convention is
+            # that pressure faults populate the pressure mask and
+            # flowrate faults populate the flowrate mask, so we route
+            # by membership in the corrupted column set.
+            target = mask_name.split("_mask_", 1)[1] if "_mask_" in mask_name else None
+            if target is not None and target in out["pressure"].columns:
+                out["pressure"][mask_name] = (
+                    mask_series.reindex(out["pressure"].index)
+                    .fillna(False)
+                    .astype(bool)
+                )
+            if target is not None and target in out["flowrate"].columns:
+                out["flowrate"][mask_name] = (
+                    mask_series.reindex(out["flowrate"].index)
+                    .fillna(False)
+                    .astype(bool)
+                )
     return out
 
 

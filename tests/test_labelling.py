@@ -24,7 +24,11 @@ def test_metadata_captures_scenario(net3_config: PipelineConfig) -> None:
     assert md["scenario_label"] == "normal"
     assert md["network_name"] == "net3"
     assert md["seed"] == 42
-    assert md["fault_summary"] == {"leaks": [], "sensor_faults": []}
+    assert md["fault_summary"] == {
+        "leaks": [],
+        "sensor_faults": [],
+        "interactions": [],
+    }
     assert md["demand_mode"] == "default"
 
 

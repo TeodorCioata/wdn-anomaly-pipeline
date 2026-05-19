@@ -25,7 +25,16 @@ def _fake_results() -> SimulationResults:
     pressure = pd.DataFrame({"n1": [10.0, 11.0, 12.0], "n2": [20.0, 21.0, 22.0]}, index=idx)
     flow = pd.DataFrame({"l1": [0.1, 0.2, 0.3]}, index=idx)
     demand = pd.DataFrame({"n1": [0.01, 0.01, 0.01], "n2": [0.0, 0.0, 0.0]}, index=idx)
-    return SimulationResults(pressure, flow, demand, elapsed_seconds=0.5)
+    leak = pd.DataFrame({"n1": [0.0, 0.0, 0.0], "n2": [0.0, 0.0, 0.0]}, index=idx)
+    return SimulationResults(
+        pressure=pressure,
+        flowrate=flow,
+        demand=demand,
+        leak_demand=leak,
+        elapsed_seconds=0.5,
+        pressure_clean=pressure.copy(),
+        flowrate_clean=flow.copy(),
+    )
 
 
 def _fake_labels(n: int) -> Labels:
@@ -52,7 +61,7 @@ def test_parquet_writer_round_trip(tmp_path: Path) -> None:
     tables = assemble_tables(_fake_results(), _fake_labels(3))
     metadata = {"scenario_type": "normal", "seed": 1}
     paths = ParquetWriter().write(tmp_path, "test", tables, metadata)
-    assert len(paths) == 3
+    assert len(paths) == 6
     for p in paths:
         assert p.exists()
         table = pq.read_table(p)
@@ -66,7 +75,7 @@ def test_parquet_writer_round_trip(tmp_path: Path) -> None:
 def test_csv_writer_round_trip(tmp_path: Path) -> None:
     tables = assemble_tables(_fake_results(), _fake_labels(3))
     paths = CsvWriter().write(tmp_path, "test", tables, {})
-    assert len(paths) == 3
+    assert len(paths) == 6
     df = pd.read_csv(paths[0])
     assert "time_seconds" in df.columns
     assert "label" in df.columns
@@ -82,8 +91,9 @@ def test_write_outputs_both_formats_and_sidecar(tmp_path: Path) -> None:
         metadata={"scenario_label": "normal"},
         write_metadata_sidecar_flag=True,
     )
-    # Three tables x two formats = 6 data files.
-    assert len(result.data_paths) == 6
+    # Six tables (pressure/flowrate/demand/leak_demand/pressure_clean/
+    # flowrate_clean) x two formats = 12 data files.
+    assert len(result.data_paths) == 12
     assert result.metadata_path is not None
     assert result.metadata_path.is_file()
     sidecar = yaml.safe_load(result.metadata_path.read_text())

@@ -1,0 +1,60 @@
+# Cumulative scenario on FOWM: a random-location leak plus an erratic
+# noise sensor fault. The leak pipe and split fraction are drawn from
+# the scenario RNG; the noise samples are drawn from a forked sub-RNG.
+# Both stages share the single seed-derived RNG, so the scenario is
+# reproducible end to end.
+
+network:
+  inp_path: networks/FOWM.inp
+  name: fowm
+
+simulation:
+  duration_seconds: 86400
+  hydraulic_timestep_seconds: 3600
+  report_timestep_seconds: 3600
+  pattern_timestep_seconds: 3600
+  demand_model: PDD
+
+seed: 99
+
+demand:
+  mode: fourier
+  fourier:
+    base: 1.0
+    amplitude: 0.3
+    period_hours: 24.0
+    phase_shift_hours: 6.0
+    noise_std: 0.0
+
+scenario:
+  type: cumulative
+  label: cumulative_leak_noise
+
+faults:
+  leaks:
+    - area_m2: 0.003
+      discharge_coeff: 0.75
+      start_time_seconds: 14400    # 04:00
+      end_time_seconds: 64800      # 18:00
+      profile: abrupt
+      name: random_abrupt_leak
+  sensor_faults:
+    - type: noise
+      quantity: pressure
+      target: "301"
+      sigma: 1.0               # metres
+      start_time_seconds: 0
+      end_time_seconds: 86400
+      rng_offset: 6
+      name: full_day_noise_node_301
+
+# Noise can push individual samples below the strict floor; widen the
+# pressure tolerances so the structural sensor checks remain the gate.
+validation:
+  pressure_min_warning_tolerance_m: 5.0
+  pressure_max_m: 200.0
+
+output:
+  directory: outputs
+  formats: [parquet, csv]
+  write_metadata_sidecar: true

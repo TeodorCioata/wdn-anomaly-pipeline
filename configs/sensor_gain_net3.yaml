@@ -1,0 +1,44 @@
+# Sensor gain fault on a Net3 pressure channel.
+# Junction "15"'s reported pressure is multiplied by 1.10 (a +10% gain)
+# between 06:00 and 18:00. The hydraulic simulation is untouched; only
+# the reported sensor reading is corrupted. A 10% gain is well above
+# the D27 detectability floor (5%), so the signal_applied check stays
+# ok rather than warning.
+
+network:
+  inp_path: Net3
+  name: net3
+
+simulation:
+  duration_seconds: 86400          # 24 hours
+  hydraulic_timestep_seconds: 3600 # 1 hour
+  report_timestep_seconds: 3600
+  demand_model: PDD
+
+seed: 42
+
+demand:
+  mode: default
+
+scenario:
+  type: sensor_fault
+  label: sensor_gain
+
+faults:
+  sensor_faults:
+    - type: gain
+      quantity: pressure
+      target: "15"
+      gain_factor: 1.10        # +10% multiplicative gain
+      start_time_seconds: 21600   # 06:00
+      end_time_seconds: 64800     # 18:00
+      name: midday_gain_node_15
+
+# Net3 node "10" baseline dip applies under PDD just as under DDA.
+validation:
+  pressure_min_warning_tolerance_m: 1.0
+
+output:
+  directory: outputs
+  formats: [parquet, csv]
+  write_metadata_sidecar: true

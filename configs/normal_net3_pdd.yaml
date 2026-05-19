@@ -1,0 +1,30 @@
+# Normal scenario on Net3 under PDD (24h, 1h timestep).
+# PDD (pressure-dependent demand) is the project default from Week 5
+# onwards: the supervisor prefers it and it removes the known Net3
+# node "10" negative-pressure artefact seen under DDA. Under PDD the
+# simulator reduces delivered demand as pressure falls instead of
+# forcing flow at negative pressure.
+
+network:
+  inp_path: Net3
+  name: net3
+
+simulation:
+  duration_seconds: 86400          # 24 hours
+  hydraulic_timestep_seconds: 3600 # 1 hour
+  report_timestep_seconds: 3600
+  demand_model: PDD
+
+seed: 42
+
+demand:
+  mode: default
+
+scenario:
+  type: normal
+  label: normal_pdd
+
+output:
+  directory: outputs
+  formats: [parquet, csv]
+  write_metadata_sidecar: true
