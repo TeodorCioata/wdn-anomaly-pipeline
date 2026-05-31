@@ -3,6 +3,10 @@
 # the scenario RNG; the noise samples are drawn from a forked sub-RNG.
 # Both stages share the single seed-derived RNG, so the scenario is
 # reproducible end to end.
+#
+# The noise fault uses the default rng_offset = 0; the Week 6 n-aware
+# std tolerance accommodates the sample variance for n=24 samples
+# without requiring a cherry-picked offset.
 
 network:
   inp_path: networks/FOWM.inp
@@ -45,7 +49,6 @@ faults:
       sigma: 1.0               # metres
       start_time_seconds: 0
       end_time_seconds: 86400
-      rng_offset: 6
       name: full_day_noise_node_301
 
 # Noise can push individual samples below the strict floor; widen the

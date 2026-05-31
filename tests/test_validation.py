@@ -123,6 +123,118 @@ def test_report_severity_aggregation() -> None:
     assert rep2.passed is False
 
 
+# ---------------------------------------------------------------------------
+# n-aware noise std tolerance (Week 6 polish)
+# ---------------------------------------------------------------------------
+
+
+def _build_noise_fault(target: str, start: int, end: int, sigma: float):
+    """Build a ResolvedSensorFault with every required field present."""
+
+    from wdn_pipeline.faults.sensor import ResolvedSensorFault
+
+    return ResolvedSensorFault(
+        type="noise",
+        quantity="pressure",
+        target=target,
+        start_time_seconds=start,
+        end_time_seconds=end,
+        bias_value=None,
+        slope_per_second=None,
+        intervals=None,
+        fill_value=None,
+        sigma=sigma,
+        rng_offset=0,
+        gain_factor=None,
+        name=None,
+    )
+
+
+def _make_noise_results(
+    n_steps: int, dt: int, sigma: float, seed: int
+) -> tuple[SimulationResults, SimulationResults]:
+    """Construct (clean, corrupted) result pairs differing only by additive noise."""
+
+    import pandas as _pd
+
+    times = [i * dt for i in range(n_steps)]
+    clean_vals = np.full(n_steps, 50.0)
+    rng = np.random.default_rng(seed)
+    noise = rng.normal(0.0, sigma, size=n_steps)
+    clean = _pd.DataFrame({"a": clean_vals}, index=_pd.Index(times, name="time_seconds"))
+    corrupted = _pd.DataFrame(
+        {"a": clean_vals + noise}, index=clean.index
+    )
+    flow = _pd.DataFrame(0.0, index=clean.index, columns=["L1"])
+    demand = _pd.DataFrame(0.0, index=clean.index, columns=["a"])
+    leak = _pd.DataFrame(0.0, index=clean.index, columns=["a"])
+    results = SimulationResults(
+        pressure=corrupted,
+        flowrate=flow,
+        demand=demand,
+        leak_demand=leak,
+        elapsed_seconds=0.0,
+        pressure_clean=clean,
+        flowrate_clean=flow.copy(),
+    )
+    return results, results  # caller only needs the first
+
+
+def test_noise_tolerance_widens_for_small_n() -> None:
+    """A 24-sample run whose sample std lands ~25-30% off sigma still
+    passes the n-aware tolerance band."""
+
+    from wdn_pipeline.validation import _check_sensor_fault_signal_applied
+
+    results, _ = _make_noise_results(n_steps=24, dt=3600, sigma=1.0, seed=99)
+    fault = _build_noise_fault(
+        target="a", start=0, end=24 * 3600, sigma=1.0
+    )
+    check = _check_sensor_fault_signal_applied(
+        results, [fault], ValidationConfig()
+    )
+    # The seed=99 draw has sample std ~0.74; the legacy 30% band would
+    # fail it. The n-aware tolerance for n=24 widens to ~4/sqrt(46) =
+    # ~0.59 sigma, so the check is OK.
+    assert check.severity == "ok"
+
+
+def test_noise_tolerance_remains_tight_for_large_n() -> None:
+    """For large n the n-aware tolerance converges to the 30% floor."""
+
+    from wdn_pipeline.validation import _check_sensor_fault_signal_applied
+
+    # Use a large clean-sample-and-noise run; std should be close to sigma.
+    results, _ = _make_noise_results(
+        n_steps=2000, dt=60, sigma=2.0, seed=11
+    )
+    fault = _build_noise_fault(
+        target="a", start=0, end=2000 * 60, sigma=2.0
+    )
+    check = _check_sensor_fault_signal_applied(
+        results, [fault], ValidationConfig()
+    )
+    assert check.severity == "ok"
+
+
+def test_noise_tolerance_rejects_gross_sigma_mismatch() -> None:
+    """A sample std that is way off the spec sigma still fails."""
+
+    from wdn_pipeline.validation import _check_sensor_fault_signal_applied
+
+    # Build a noise residual with sigma=5 but claim sigma=1.
+    results, _ = _make_noise_results(
+        n_steps=24, dt=3600, sigma=5.0, seed=0
+    )
+    fault = _build_noise_fault(
+        target="a", start=0, end=24 * 3600, sigma=1.0
+    )
+    check = _check_sensor_fault_signal_applied(
+        results, [fault], ValidationConfig()
+    )
+    assert check.severity == "fail"
+
+
 def test_residuals_near_zero_for_identical_runs(net3_results) -> None:
     """Two simulations with identical inputs must agree to numerical noise.
 

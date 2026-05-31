@@ -18,9 +18,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated
 
+import click
 import numpy as np
 import pandas as pd
 import typer
+from typer.core import TyperGroup
 
 from wdn_pipeline.config import PipelineConfig, load_config
 from wdn_pipeline.demand import apply_demand
@@ -113,11 +115,13 @@ def _seed_everything(seed: int) -> None:
     np.random.seed(seed)
 
 
-def run(config: PipelineConfig) -> RunSummary:
+def run(config: PipelineConfig, config_path: str | None = None) -> RunSummary:
     """Execute the pipeline for a single validated config.
 
     Args:
         config: A validated :class:`PipelineConfig`.
+        config_path: Optional source path of the YAML config. Forwarded
+            to the DuckDB writer's ``scenarios`` row for traceability.
 
     Returns:
         A :class:`RunSummary` with output paths and validation details.
@@ -212,6 +216,7 @@ def run(config: PipelineConfig) -> RunSummary:
             )
 
     logger.info("Writing outputs to %s", config.output.directory)
+    duckdb_target = config.output.duckdb_path if config.output.duckdb else None
     write_result: WriteResult = write_outputs(
         directory=config.output.directory,
         basename=basename,
@@ -219,6 +224,9 @@ def run(config: PipelineConfig) -> RunSummary:
         tables=tables,
         metadata=labels.metadata,
         write_metadata_sidecar_flag=config.output.write_metadata_sidecar,
+        duckdb_path=duckdb_target,
+        validation_severity=report.severity,
+        config_path=config_path,
     )
 
     return RunSummary(
@@ -240,10 +248,37 @@ def run_from_config_file(config_path: str | Path) -> RunSummary:
     """Load a YAML config file and run the pipeline."""
 
     cfg = load_config(config_path)
-    return run(cfg)
+    return run(cfg, config_path=str(config_path))
 
 
-app = typer.Typer(add_completion=False, help="WDN Anomaly Simulation Pipeline")
+class _DefaultCommandGroup(TyperGroup):
+    """Typer group that routes unknown subcommands to a default command.
+
+    Lets ``wdn-pipeline configs/foo.yaml`` keep working (the legacy
+    single-config form) while ``wdn-pipeline batch ...`` invokes the
+    new batch subcommand. When the first positional token is not a
+    registered subcommand name, the token is treated as the first
+    argument of the default command ``run``.
+    """
+
+    default_command_name = "run"
+
+    def resolve_command(self, ctx, args):
+        try:
+            return super().resolve_command(ctx, args)
+        except click.exceptions.UsageError:
+            if args and not args[0].startswith("-"):
+                args.insert(0, self.default_command_name)
+                return super().resolve_command(ctx, args)
+            raise
+
+
+app = typer.Typer(
+    add_completion=False,
+    help="WDN Anomaly Simulation Pipeline",
+    no_args_is_help=True,
+    cls=_DefaultCommandGroup,
+)
 
 
 @app.command("run")
@@ -254,14 +289,19 @@ def cli_run(
             exists=True,
             dir_okay=False,
             readable=True,
-            help="Path to the YAML pipeline config.",
+            help="Path to a single YAML pipeline config.",
         ),
     ],
     verbose: Annotated[
         bool, typer.Option("--verbose", "-v", help="Enable INFO-level logging.")
     ] = False,
 ) -> None:
-    """Run the pipeline for a single config and print a summary."""
+    """Run a single config and print a summary.
+
+    This is the default command: ``wdn-pipeline configs/foo.yaml``
+    forwards here transparently when the first argument is not a
+    registered subcommand name.
+    """
 
     logging.basicConfig(
         level=logging.INFO if verbose else logging.WARNING,
@@ -270,6 +310,114 @@ def cli_run(
     summary = run_from_config_file(config)
     typer.echo(summary.format())
     if not summary.validation.passed:
+        raise typer.Exit(code=1)
+
+
+@app.command("batch")
+def cli_batch(
+    configs: Annotated[
+        list[Path] | None,
+        typer.Argument(
+            help="Explicit YAML config paths or glob patterns (e.g. "
+            "'configs/cumulative_*.yaml'). May be combined with "
+            "--config-dir.",
+        ),
+    ] = None,
+    config_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-dir",
+            "-d",
+            exists=True,
+            file_okay=False,
+            help="Directory to scan for YAML configs (default pattern *.yaml).",
+        ),
+    ] = None,
+    glob_pattern: Annotated[
+        str,
+        typer.Option(
+            "--glob",
+            help="Glob pattern used with --config-dir.",
+        ),
+    ] = "*.yaml",
+    report_dir: Annotated[
+        Path,
+        typer.Option(
+            "--report-dir",
+            help="Where to write batch_summary.json and batch_summary.txt.",
+        ),
+    ] = Path("outputs/batch_runs"),
+    workers: Annotated[
+        int,
+        typer.Option(
+            "--workers",
+            "-w",
+            min=1,
+            help="Number of worker processes. 1 = sequential (default); "
+            ">1 uses a ProcessPoolExecutor with the spawn start method.",
+        ),
+    ] = 1,
+    duckdb: Annotated[
+        Path | None,
+        typer.Option(
+            "--duckdb",
+            help="If set, consolidate every scenario's tables into this "
+            "DuckDB file (decision D30). Overrides any per-config "
+            "output.duckdb_path. Adds a 'scenarios' metadata table.",
+        ),
+    ] = None,
+    verbose: Annotated[
+        bool, typer.Option("--verbose", "-v", help="Enable INFO-level logging.")
+    ] = False,
+) -> None:
+    """Run a batch of configs and write summary artefacts.
+
+    A failure of any individual config is captured in the summary and
+    does not abort the batch. Exit code is 1 if any run had severity
+    ``fail`` or threw an exception, 0 otherwise.
+
+    Phase 5 Week 7: ``--workers N`` enables parallel execution via
+    :class:`concurrent.futures.ProcessPoolExecutor`; ``--duckdb PATH``
+    consolidates the batch into a single queryable DuckDB file.
+    """
+
+    import time as _time
+
+    from wdn_pipeline.batch import resolve_config_paths, run_batch
+
+    logging.basicConfig(
+        level=logging.INFO if verbose else logging.WARNING,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+    config_paths = resolve_config_paths(
+        paths=[str(p) for p in configs] if configs else None,
+        config_dir=config_dir,
+        glob_pattern=glob_pattern,
+    )
+    if not config_paths:
+        raise typer.BadParameter(
+            "No config paths resolved. Provide explicit paths, a glob, "
+            "or --config-dir."
+        )
+
+    batch_id = _time.strftime("%Y%m%dT%H%M%S")
+    out_dir = report_dir / batch_id
+    summary = run_batch(
+        config_paths,
+        out_dir,
+        batch_id=batch_id,
+        workers=workers,
+        duckdb_path=duckdb,
+    )
+    typer.echo(
+        f"batch {summary.batch_id}: total={summary.n_total} ok={summary.n_ok} "
+        f"warning={summary.n_warning} fail={summary.n_fail} error={summary.n_error} "
+        f"workers={summary.workers} elapsed={summary.elapsed_seconds:.2f}s"
+    )
+    if summary.duckdb_path is not None:
+        typer.echo(f"duckdb written to {summary.duckdb_path}")
+    typer.echo(f"summary written to {out_dir / 'batch_summary.txt'}")
+    if summary.n_fail or summary.n_error:
         raise typer.Exit(code=1)
 
 

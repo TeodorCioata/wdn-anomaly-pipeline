@@ -548,12 +548,21 @@ def _check_sensor_fault_signal_applied(
                 continue
             mean = float(np.mean(inside_diff))
             std = float(np.std(inside_diff, ddof=0))
-            # Statistical tolerances: 4*sigma/sqrt(n) is ~99.99% CI for
-            # the sample mean of a Gaussian. Std uses a 30% relative
-            # band to absorb small sample sizes (Net3's 24-hour-1-hour
-            # grid has at most 25 samples).
+            # Statistical tolerances: ~99.99% CI for the sample mean and
+            # the sample std of a Gaussian.
+            #
+            # - mean: standard error is sigma/sqrt(n); scale by 4 (~4-sigma).
+            # - std: standard error of the sample std is approximately
+            #   sigma/sqrt(2*(n-1)); scale by 4 (~4-sigma).
+            #
+            # The std band is floored at 0.30 * sigma so the tolerance never
+            # widens further than the legacy "30% relative" cap once n is
+            # large; for small n (Net3's 24-hour grid, n=24) the n-aware
+            # term dominates and removes the need to cherry-pick
+            # ``rng_offset`` values to land inside tolerance.
             mean_tol = max(4.0 * sigma / max(1.0, n**0.5), 1e-9)
-            std_tol = max(0.30 * sigma, 1e-9)
+            std_se_tol = 4.0 * sigma / max(1.0, (2.0 * max(1, n - 1)) ** 0.5)
+            std_tol = max(0.30 * sigma, std_se_tol, 1e-9)
             summaries.append(
                 f"noise@{fault.target}: n={n} mean={mean:.3e} std={std:.3f} "
                 f"(sigma={sigma:.3f})"

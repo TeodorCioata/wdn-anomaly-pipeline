@@ -353,12 +353,22 @@ class OutputConfig(_Frozen):
             back to the original pipe name so the output schema matches
             the original network. Default false (explicit opt-in). The
             ``leak_demand`` diagnostic table is never affected.
+        duckdb: When true the scenario's tables are also inserted into a
+            consolidated DuckDB file at ``duckdb_path`` (decision D30).
+            Default false. The batch CLI (``wdn-pipeline batch --duckdb
+            PATH``) sets this implicitly for every scenario in the
+            batch, overriding ``duckdb_path`` with the CLI value.
+        duckdb_path: Target DuckDB file when ``duckdb`` is true. Parent
+            directory is created on demand. Required when ``duckdb`` is
+            true; the model validator enforces this.
     """
 
     directory: Path = Path("outputs")
     formats: list[Literal["parquet", "csv"]] = Field(default_factory=lambda: ["parquet", "csv"])
     write_metadata_sidecar: bool = True
     remove_leak_nodes: bool = False
+    duckdb: bool = False
+    duckdb_path: Path | None = None
 
     @model_validator(mode="after")
     def _validate_formats(self) -> OutputConfig:
@@ -366,6 +376,10 @@ class OutputConfig(_Frozen):
             raise ValueError("output.formats must list at least one format")
         if len(set(self.formats)) != len(self.formats):
             raise ValueError("output.formats must not contain duplicates")
+        if self.duckdb and self.duckdb_path is None:
+            raise ValueError(
+                "output.duckdb_path is required when output.duckdb is true"
+            )
         return self
 
 
