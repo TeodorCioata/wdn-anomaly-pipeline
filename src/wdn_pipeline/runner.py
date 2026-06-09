@@ -32,7 +32,12 @@ from wdn_pipeline.faults.sensor import (
     SensorFaultInjector,
 )
 from wdn_pipeline.labelling import build_labels
-from wdn_pipeline.network import derive_network_name, load_network
+from wdn_pipeline.network import (
+    HydraulicOverride,
+    apply_hydraulic_options,
+    derive_network_name,
+    load_network,
+)
 from wdn_pipeline.output import (
     WriteResult,
     assemble_tables,
@@ -67,6 +72,7 @@ class RunSummary:
     resolved_leaks: list[ResolvedLeak]
     resolved_sensor_faults: list[ResolvedSensorFault] = field(default_factory=list)
     interactions: list[dict] = field(default_factory=list)
+    option_overrides: list[HydraulicOverride] = field(default_factory=list)
 
     def format(self) -> str:
         lines = [
@@ -78,6 +84,15 @@ class RunSummary:
             f"output_paths    : {[str(p) for p in self.output_paths]}",
             f"metadata_path   : {self.metadata_path}",
         ]
+        if self.option_overrides:
+            lines.append(
+                f"calibration     : {len(self.option_overrides)} hydraulic "
+                "option override(s)"
+            )
+            for o in self.option_overrides:
+                lines.append(
+                    f"  {o.option} : {o.inp_value!r} (.inp) -> {o.config_value!r} (config)"
+                )
         if self.resolved_leaks:
             lines.append(f"resolved_leaks  : {len(self.resolved_leaks)}")
             for i, leak in enumerate(self.resolved_leaks):
@@ -132,6 +147,17 @@ def run(config: PipelineConfig, config_path: str | None = None) -> RunSummary:
     logger.info("Loading network %s", network_name)
     wn = load_network(config.network, config.simulation)
 
+    option_overrides = apply_hydraulic_options(wn, config.simulation)
+    if option_overrides:
+        logger.info(
+            "Applied %d hydraulic calibration override(s): %s",
+            len(option_overrides),
+            "; ".join(
+                f"{o.option}={o.config_value!r} (was {o.inp_value!r})"
+                for o in option_overrides
+            ),
+        )
+
     logger.info("Applying demand strategy: %s", config.demand.mode)
     apply_demand(wn, config.demand, config.seed)
 
@@ -171,6 +197,13 @@ def run(config: PipelineConfig, config_path: str | None = None) -> RunSummary:
         resolved_leaks,
         resolved_sensor_faults,
     )
+
+    # Calibration provenance: record every overridden hydraulic option
+    # into the sidecar metadata so a downstream consumer can audit how a
+    # scenario was calibrated.
+    labels.metadata["calibration_overrides"] = [
+        o.to_dict() for o in option_overrides
+    ]
 
     interactions = labels.metadata.get("fault_summary", {}).get("interactions", [])
     if interactions:
@@ -227,6 +260,7 @@ def run(config: PipelineConfig, config_path: str | None = None) -> RunSummary:
         duckdb_path=duckdb_target,
         validation_severity=report.severity,
         config_path=config_path,
+        duckdb_wide_tables=config.output.duckdb_wide_tables,
     )
 
     return RunSummary(
@@ -241,6 +275,7 @@ def run(config: PipelineConfig, config_path: str | None = None) -> RunSummary:
         resolved_leaks=resolved_leaks,
         resolved_sensor_faults=resolved_sensor_faults,
         interactions=interactions,
+        option_overrides=option_overrides,
     )
 
 
@@ -366,6 +401,16 @@ def cli_batch(
             "output.duckdb_path. Adds a 'scenarios' metadata table.",
         ),
     ] = None,
+    duckdb_long_only: Annotated[
+        bool,
+        typer.Option(
+            "--duckdb-long-only",
+            help="Consolidate as long tables + scenarios catalogue only, "
+            "skipping the per-scenario wide tables (decision D35). Far "
+            "smaller and faster for large batches; the query layer slices "
+            "the long tables. Whole-scenario flat export stays in Parquet/CSV.",
+        ),
+    ] = False,
     verbose: Annotated[
         bool, typer.Option("--verbose", "-v", help="Enable INFO-level logging.")
     ] = False,
@@ -408,6 +453,7 @@ def cli_batch(
         batch_id=batch_id,
         workers=workers,
         duckdb_path=duckdb,
+        duckdb_wide_tables=not duckdb_long_only,
     )
     typer.echo(
         f"batch {summary.batch_id}: total={summary.n_total} ok={summary.n_ok} "
@@ -419,6 +465,162 @@ def cli_batch(
     typer.echo(f"summary written to {out_dir / 'batch_summary.txt'}")
     if summary.n_fail or summary.n_error:
         raise typer.Exit(code=1)
+
+
+_VALUE_QUANTITIES = {"pressure", "flowrate", "demand", "leak_demand"}
+_QUERY_QUANTITIES = _VALUE_QUANTITIES | {"labels", "masks"}
+
+
+@app.command("query")
+def cli_query(
+    db_path: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Path to a pipeline DuckDB file (a batch --duckdb run).",
+        ),
+    ],
+    list_scenarios: Annotated[
+        bool,
+        typer.Option("--list-scenarios", help="Print the scenarios catalogue and exit."),
+    ] = False,
+    quantity: Annotated[
+        str | None,
+        typer.Option(
+            "--quantity",
+            help="One of pressure / flowrate / demand / leak_demand / labels / masks.",
+        ),
+    ] = None,
+    scenario: Annotated[
+        str | None, typer.Option("--scenario", help="Single scenario basename.")
+    ] = None,
+    scenario_type: Annotated[
+        str | None,
+        typer.Option(
+            "--scenario-type",
+            help="Query every scenario of this class (normal/leak/sensor_fault/cumulative).",
+        ),
+    ] = None,
+    network: Annotated[
+        str | None, typer.Option("--network", help="Filter the catalogue by network.")
+    ] = None,
+    severity: Annotated[
+        str | None, typer.Option("--severity", help="Filter the catalogue by severity.")
+    ] = None,
+    names: Annotated[
+        str | None,
+        typer.Option(
+            "--names",
+            "--nodes",
+            "--links",
+            help="Comma-separated node (pressure/demand) or link (flowrate) names.",
+        ),
+    ] = None,
+    masks: Annotated[
+        str | None,
+        typer.Option("--masks", help="Comma-separated mask names (for --quantity masks)."),
+    ] = None,
+    t_start: Annotated[
+        int | None, typer.Option("--t-start", help="Inclusive start time (seconds).")
+    ] = None,
+    t_end: Annotated[
+        int | None, typer.Option("--t-end", help="Exclusive end time (seconds).")
+    ] = None,
+    label: Annotated[
+        int | None,
+        typer.Option("--label", help="Filter labels to this value (1 = anomalous)."),
+    ] = None,
+    wide: Annotated[
+        bool, typer.Option("--wide", help="Pivot to the timestep x channel matrix.")
+    ] = False,
+    out: Annotated[
+        Path | None,
+        typer.Option("--out", help="Write the slice to a .csv or .parquet file."),
+    ] = None,
+    limit: Annotated[
+        int, typer.Option("--limit", help="Rows to print when --out is not given.")
+    ] = 20,
+) -> None:
+    """Slice a pipeline DuckDB file from the shell (decision D32).
+
+    Examples::
+
+        wdn-pipeline query outputs/scale_run.duckdb --list-scenarios
+        wdn-pipeline query outputs/scale_run.duckdb --quantity pressure \\
+            --scenario net3_leak_abrupt_42 --nodes 10,15 \\
+            --t-start 21600 --t-end 64800 --out slice.csv
+    """
+
+    from wdn_pipeline.query import DatasetQuery
+
+    names_list = [n for n in names.split(",") if n] if names else None
+    masks_list = [m for m in masks.split(",") if m] if masks else None
+
+    with DatasetQuery(db_path) as q:
+        if list_scenarios or quantity is None:
+            df = q.scenarios(scenario_type=scenario_type, network=network, severity=severity)
+            _emit_query_result(df, out, limit, index=False)
+            return
+
+        if quantity not in _QUERY_QUANTITIES:
+            raise typer.BadParameter(
+                f"--quantity must be one of {sorted(_QUERY_QUANTITIES)}"
+            )
+
+        # Resolve a scenario class to its scenario set via the catalogue.
+        scen_list: list[str] | None = None
+        if scenario_type is not None:
+            cat = q.scenarios(scenario_type=scenario_type, network=network)
+            scen_list = list(cat["scenario_basename"])
+
+        if quantity in _VALUE_QUANTITIES:
+            kwargs = dict(
+                scenario=scenario,
+                scenarios=scen_list,
+                t_start=t_start,
+                t_end=t_end,
+                wide=wide,
+            )
+            if quantity == "flowrate":
+                df = q.flowrate(links=names_list, **kwargs)
+            else:
+                df = getattr(q, quantity)(nodes=names_list, **kwargs)
+        elif quantity == "labels":
+            df = q.labels(
+                scenario=scenario,
+                scenarios=scen_list,
+                t_start=t_start,
+                t_end=t_end,
+                label=label,
+            )
+        else:  # masks
+            df = q.masks(
+                scenario=scenario,
+                scenarios=scen_list,
+                masks=masks_list,
+                t_start=t_start,
+                t_end=t_end,
+            )
+        _emit_query_result(df, out, limit, index=wide)
+
+
+def _emit_query_result(
+    df: pd.DataFrame, out: Path | None, limit: int, index: bool
+) -> None:
+    """Write the query result to a file or print a preview."""
+
+    if out is not None:
+        if out.suffix == ".parquet":
+            df.to_parquet(out)
+        else:
+            df.to_csv(out, index=index)
+        typer.echo(f"wrote {len(df)} rows to {out}")
+        return
+    typer.echo(df.head(limit).to_string(index=index))
+    if len(df) > limit:
+        typer.echo(f"... {len(df) - limit} more rows (use --limit or --out)")
 
 
 def main() -> None:  # pragma: no cover - thin CLI entry point

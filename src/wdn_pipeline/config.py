@@ -41,6 +41,14 @@ class NetworkConfig(_Frozen):
 class SimulationConfig(_Frozen):
     """Simulation timing and hydraulic options.
 
+    The calibration fields (decision D33, Week 8) expose WNTR's
+    ``wn.options.hydraulic`` surface so simulations can be calibrated
+    per network. Every calibration field defaults to ``None`` meaning
+    "leave the .inp value untouched" — important because some LeakG3PD
+    networks ship their own calibrated values. Overrides are applied in
+    :func:`wdn_pipeline.network.apply_hydraulic_options` and logged into
+    the run summary and metadata sidecar for provenance.
+
     Attributes:
         duration_seconds: Total simulation length.
         hydraulic_timestep_seconds: Solver step size.
@@ -50,6 +58,29 @@ class SimulationConfig(_Frozen):
             advance. If ``None`` the .inp default is kept.
         demand_model: ``DDA`` (demand-driven, the EPANET default) or
             ``PDD`` (pressure-dependent, required when leaks are present).
+        viscosity: Kinematic viscosity relative to water at 20 C
+            (WNTR/EPANET default ``1.0``). Affects Darcy-Weisbach
+            headloss.
+        specific_gravity: Fluid specific gravity relative to water
+            (default ``1.0``).
+        headloss: Headloss formula: ``H-W`` (Hazen-Williams), ``D-W``
+            (Darcy-Weisbach) or ``C-M`` (Chezy-Manning).
+        accuracy: Solver convergence accuracy (default ``0.001``).
+        trials: Maximum solver trials per timestep (default ``40``).
+        demand_multiplier: Global multiplier applied to all demands
+            (default ``1.0``).
+        minimum_pressure: PDD lower pressure bound in metres below which
+            demand is zero (default ``0.0``). PDD only.
+        required_pressure: PDD pressure in metres at and above which full
+            demand is delivered (default ``0.07``). PDD only.
+        pressure_exponent: PDD demand curve exponent (default ``0.5``).
+            PDD only.
+        extra_hydraulic_options: Escape hatch for WNTR hydraulic options
+            not in the allowlist above. Each key is applied with
+            ``setattr`` only after verifying it exists on
+            ``wn.options.hydraulic``; unknown keys raise at network prep
+            (D33), so typos fail loudly rather than being silently
+            ignored.
     """
 
     duration_seconds: Annotated[int, Field(gt=0)]
@@ -57,6 +88,18 @@ class SimulationConfig(_Frozen):
     report_timestep_seconds: Annotated[int, Field(gt=0)] = 3600
     pattern_timestep_seconds: Annotated[int, Field(gt=0)] | None = None
     demand_model: Literal["DDA", "PDD"] = "DDA"
+
+    # --- Hydraulic calibration allowlist (D33). None = untouched. ---
+    viscosity: Annotated[float, Field(gt=0)] | None = None
+    specific_gravity: Annotated[float, Field(gt=0)] | None = None
+    headloss: Literal["H-W", "D-W", "C-M"] | None = None
+    accuracy: Annotated[float, Field(gt=0)] | None = None
+    trials: Annotated[int, Field(gt=0)] | None = None
+    demand_multiplier: Annotated[float, Field(gt=0)] | None = None
+    minimum_pressure: float | None = None
+    required_pressure: Annotated[float, Field(gt=0)] | None = None
+    pressure_exponent: Annotated[float, Field(gt=0)] | None = None
+    extra_hydraulic_options: dict[str, float | int | str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _validate_timesteps(self) -> SimulationConfig:
@@ -68,6 +111,16 @@ class SimulationConfig(_Frozen):
             raise ValueError(
                 "duration_seconds must be a multiple of hydraulic_timestep_seconds"
             )
+        # PDD-only calibration fields: setting any under DDA is a likely
+        # config mistake (EPANET silently ignores them otherwise).
+        if self.demand_model != "PDD":
+            for field_name in ("minimum_pressure", "required_pressure", "pressure_exponent"):
+                if getattr(self, field_name) is not None:
+                    raise ValueError(
+                        f"simulation.{field_name} is a pressure-dependent (PDD) "
+                        f"option and must not be set when demand_model is "
+                        f"'{self.demand_model}'. Set demand_model: PDD or remove it."
+                    )
         return self
 
 
@@ -361,6 +414,16 @@ class OutputConfig(_Frozen):
         duckdb_path: Target DuckDB file when ``duckdb`` is true. Parent
             directory is created on demand. Required when ``duckdb`` is
             true; the model validator enforces this.
+        duckdb_wide_tables: When true (default, decision D30) the DuckDB
+            file also materialises the per-scenario wide tables
+            (``{basename}_{table}``). When false the file holds only the
+            consolidated long tables (``pressure_long`` etc.) plus the
+            ``scenarios`` catalogue (decision D35). The long tables are
+            what the query layer slices; the per-scenario wide tables
+            cost DuckDB a storage block each, so a large consolidated
+            batch is far smaller and faster to write long-only.
+            Whole-scenario flat export stays available via the Parquet
+            and CSV writers.
     """
 
     directory: Path = Path("outputs")
@@ -369,6 +432,7 @@ class OutputConfig(_Frozen):
     remove_leak_nodes: bool = False
     duckdb: bool = False
     duckdb_path: Path | None = None
+    duckdb_wide_tables: bool = True
 
     @model_validator(mode="after")
     def _validate_formats(self) -> OutputConfig:

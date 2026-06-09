@@ -1,6 +1,6 @@
 """Per-timestep labels and per-scenario metadata.
 
-Two complementary artefacts (decision D10):
+Two complementary artefacts:
 
 - A per-timestep ``label`` column attached to the wide pressure / flow
   DataFrames at output time. ``0`` means normal, ``1`` means anomalous.
@@ -10,7 +10,7 @@ Two complementary artefacts (decision D10):
   seed, scenario type, fault parameters, time window). The runner
   serialises this next to each output file.
 
-Per-channel masks (D22) are not stored in :class:`Labels` itself; the
+Per-channel masks are not stored in :class:`Labels` itself; the
 runner attaches them directly to the corresponding output table via
 :mod:`wdn_pipeline.output` to keep this module's responsibilities
 narrow.

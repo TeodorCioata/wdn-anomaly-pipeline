@@ -117,6 +117,17 @@ simulation:
   report_timestep_seconds: 3600
   pattern_timestep_seconds: 3600  # optional; defaults to .inp value
   demand_model: DDA           # DDA | PDD
+  # --- Calibration options (D33, Week 8). All optional; omit = .inp value kept ---
+  headloss: H-W               # H-W only (WNTRSimulator is Hazen-Williams; see D34)
+  viscosity: 1.0              # relative kinematic viscosity (inert under H-W)
+  specific_gravity: 1.0
+  accuracy: 0.001             # solver convergence accuracy
+  trials: 40                  # max solver trials per timestep
+  demand_multiplier: 1.0      # global demand scale
+  minimum_pressure: 0.0       # PDD only
+  required_pressure: 0.07     # PDD only
+  pressure_exponent: 0.5      # PDD only
+  extra_hydraulic_options: {} # validated passthrough for non-allowlist options
 
 seed: 42
 
@@ -154,6 +165,7 @@ output:
   remove_leak_nodes: false    # D28: revert leak-node split artefacts on output
   duckdb: false               # D30: also write to a consolidated DuckDB file
   duckdb_path: null           # required when duckdb=true
+  duckdb_wide_tables: true    # D35: include per-scenario wide tables (false = long-only)
 ```
 
 ### Demand modes
@@ -163,6 +175,30 @@ output:
 - `fourier` — replace patterns with a synthetic diurnal pattern: `m(t) = base + amplitude * sin(2π t / period + phase) + N(0, noise_std)`. Multipliers are clipped at zero. Deterministic given the seed.
 
 Adding a new strategy means subclassing `DemandStrategy` in `demand.py` and registering it in `STRATEGIES`.
+
+### Simulation calibration options (Phase 5 Week 8)
+
+The LeakG3PD paper names per-network calibration as a limitation. The pipeline exposes WNTR's `wn.options.hydraulic` surface so simulations can be calibrated per network. Strategy: a typed allowlist of common options plus a validated `extra_hydraulic_options` passthrough (decision D33). Every field is optional and defaults to `None` meaning "leave the .inp value untouched" — important because some networks ship their own calibrated values. Each applied override is logged in the run summary (`--verbose`) and recorded under `calibration_overrides` in the metadata sidecar for provenance.
+
+| Option | WNTR meaning | Unit | Default |
+|---|---|---|---|
+| `viscosity` | Kinematic viscosity relative to water at 20 C. Affects Darcy-Weisbach headloss only | dimensionless | 1.0 |
+| `specific_gravity` | Fluid specific gravity relative to water | dimensionless | 1.0 |
+| `headloss` | Headloss formula: `H-W`, `D-W` or `C-M` | enum | `H-W` |
+| `accuracy` | Solver convergence accuracy | dimensionless | 0.001 |
+| `trials` | Maximum solver trials per timestep | count | 40 |
+| `demand_multiplier` | Global multiplier applied to all demands | dimensionless | 1.0 |
+| `minimum_pressure` | PDD lower pressure bound below which demand is zero | m | 0.0 |
+| `required_pressure` | PDD pressure at/above which full demand is delivered | m | 0.07 |
+| `pressure_exponent` | PDD demand-curve exponent | dimensionless | 0.5 |
+| `extra_hydraulic_options` | Map of any other `wn.options.hydraulic` attribute to a value; unknown keys raise at network prep | dict | `{}` |
+
+Two guards apply:
+
+- **PDD-only options** (`minimum_pressure`, `required_pressure`, `pressure_exponent`) are rejected at config load under `demand_model: DDA` — EPANET silently ignores them there, so setting them is a likely mistake.
+- **Headloss formula** : the pipeline always uses `WNTRSimulator` (for leak + PDD support), which only implements Hazen-Williams. `headloss: D-W`/`C-M` is rejected at network prep with a clear message and `viscosity` (which only affects Darcy-Weisbach) is inert under WNTRSimulator. Darcy-Weisbach calibration would require the `EpanetSimulator`, which has no leak support.
+
+See `configs/normal_net3_calibrated.yaml` for a worked example. Run it with `--verbose` to see the override log.
 
 ### Output writers
 
@@ -179,6 +215,54 @@ con.sql(
 ).show()
 con.sql('SELECT * FROM "net3_cumulative_leak_bias_42_pressure" LIMIT 5').show()
 ```
+
+### Querying a dataset: partial retrieval (Phase 5 Week 8)
+
+Experiment outputs are large, so consumers should retrieve **slices** rather than whole datasets. The DuckDB writer materialises, alongside the per-scenario wide tables, a set of consolidated **long tables** that accumulate every scenario's measurements for efficient cross-scenario slicing:
+
+| Long table | Columns |
+|---|---|
+| `pressure_long` / `flowrate_long` / `demand_long` / `leak_demand_long` | `scenario_basename, time_seconds, name, value` |
+| `labels_long` | `scenario_basename, time_seconds, label` |
+| `masks_long` | `scenario_basename, time_seconds, mask, value` |
+
+Each is indexed on `(scenario_basename, name, time_seconds)`. The wide per-scenario tables are kept for whole-scenario export; the long tables are additive.
+
+For large consolidated batches, build the file **long-only** to keep it compact: the per-scenario wide tables cost DuckDB a storage block each, so a 520-scenario file is ~205 MB long-only versus ~1.6 GB with the wide tables, and writes in a fraction of the time. Use `wdn-pipeline batch ... --duckdb PATH --duckdb-long-only` (or `output.duckdb_wide_tables: false` for a single run). The query layer slices the long tables either way; whole-scenario flat export stays in the Parquet/CSV tree.
+
+`wdn_pipeline.query.DatasetQuery` wraps a read-only DuckDB connection with parametrised slice methods. Filters are optional and composable (`None` = all); time windows are half-open `[t_start, t_end)`; `wide=True` pivots back to the timestep x channel matrix for ML use. All values are bound (never string-interpolated), so a node name is always treated as data.
+
+```python
+from wdn_pipeline.query import DatasetQuery
+
+with DatasetQuery("outputs/scale_run.duckdb") as q:
+    q.scenarios(scenario_type="leak", network="net3")            # browse the catalogue
+    q.pressure(scenario="net3_leak_5", nodes=["10", "15"],       # one scenario, two nodes,
+               t_start=21600, t_end=64800)                       #   6h window (long form)
+    q.pressure(scenarios=net3_leaks, nodes=["10"])               # one node across many scenarios
+    q.pressure(scenario="net3_leak_5", nodes=["10"], wide=True)  # timestep x node matrix
+    q.labels(scenario="net3_leak_5", label=1)                    # only anomalous timesteps
+    q.masks(scenario="net3_sensor_bias_3")                       # per-channel sensor masks
+    q.flowrate(scenario="net3_leak_5", links=["10"])             # link-addressed
+    q.sql("SELECT ... FROM pressure_long WHERE ...")             # raw SQL escape hatch
+```
+
+A `wdn-pipeline query` CLI subcommand reuses the same builder for shell-level slices into CSV or Parquet:
+
+```bash
+# Browse the catalogue
+wdn-pipeline query outputs/scale_run.duckdb --list-scenarios
+
+# One scenario, named nodes, a time window, to CSV
+wdn-pipeline query outputs/scale_run.duckdb --quantity pressure \
+    --scenario net3_leak_5 --nodes 10,15 --t-start 21600 --t-end 64800 --out slice.csv
+
+# One node across every leak scenario, to Parquet
+wdn-pipeline query outputs/scale_run.duckdb --quantity pressure \
+    --scenario-type leak --nodes 15 --out leaks_node15.parquet
+```
+
+`--nodes`, `--links` and `--names` are aliases for the same channel filter. See `notebooks/02_query_demo.ipynb` for a runnable walkthrough.
 
 ### Validation severity
 
@@ -347,7 +431,7 @@ From Week 5 onwards the project default for normal scenarios is the pressure-dep
 pytest
 ```
 
-Currently **186 tests** covering every module: config schema (with leak-spec, sensor-fault and DuckDB invariants), network loading, demand strategies, simulation, leak injection (abrupt + linear + multi), sensor fault injection (bias / drift / stuck / dropout / noise / gain), leak-node cleanup post-processing, cumulative scenarios, PDD normal scenarios, labelling, validation severity (leak-aware mass balance, leak demand active, sensor fault mask consistency, sensor fault signal applied with n-aware noise tolerance, gain detectability), output writers, DuckDB single-scenario / batch / round-trip / idempotency, organise-outputs categorisation and README rendering, batch driver (sequential + parallel parity) and end-to-end runner determinism.
+Currently **230 tests** covering every module: config schema (with leak-spec, sensor-fault, calibration and DuckDB invariants), network loading, hydraulic calibration options (allowlist + validated passthrough, PDD-only and D-W guards), demand strategies, simulation (incl. the empty-result non-convergence guard), leak injection (abrupt + linear + multi), sensor fault injection (bias / drift / stuck / dropout / noise / gain), leak-node cleanup post-processing, cumulative scenarios, PDD normal scenarios, labelling, validation severity (leak-aware mass balance run on clean frames, leak demand active, sensor fault mask consistency, sensor fault signal applied with n-aware noise tolerance, gain detectability), output writers, DuckDB single-scenario / batch / round-trip / idempotency / long-table population, the `DatasetQuery` query layer and `wdn-pipeline query` CLI (slicing, half-open windows, wide round-trip, read-only safety, parametrised-binding injection safety), the LeakG3PD network sweep smoke tests, organise-outputs categorisation and README rendering, batch driver (sequential + parallel parity) and end-to-end runner determinism.
 
 ---
 
@@ -454,9 +538,18 @@ Runs every config in `configs/` twice into separate output directories and compa
 - `scripts/organise_outputs.py` writes a Drive-ready CSV tree under `outputs/organised/{normal,leak,sensor_fault,cumulative}/<network>/<variant>/` with a top-level `README.md` documenting layout and source configs
 - 17 new tests (`test_duckdb.py` ×9, `test_batch.py` parallel cluster ×3, `test_organise_outputs.py` ×5). **186 tests total**, ruff clean on `src/` and `tests/`
 
+### Phase 5 Week 8: query layer, calibration, network sweep, parallelisation benchmark — complete
+
+- **Query layer:** `wdn_pipeline.query.DatasetQuery` + `wdn-pipeline query` CLI for partial retrieval (node/link/time/scenario/class slices). Materialised long tables (`pressure_long` etc.) indexed on `(scenario_basename, name, time_seconds)` for cross-scenario queries; `notebooks/02_query_demo.ipynb` walkthrough
+- **Calibration options:** WNTR hydraulic option allowlist plus validated `extra_hydraulic_options` passthrough; PDD-only and D-W/C-M guards; provenance logged to summary and sidecar; `configs/normal_net3_calibrated.yaml`
+- **Network sweep:** every LeakG3PD `.inp` run through the pipeline; `docs/network_sweep_report.md`. Added a non-convergence guard in `run_simulation` (empty results fail clearly instead of crashing the validators)
+- **Scale run + benchmark:** ~520-scenario generator (`scripts/generate_scale_configs.py`, one master seed), consolidated `outputs/scale_run.duckdb`; `scripts/benchmark_parallel.py` + `docs/parallelisation_benchmark.md` (best speedup at the physical core count; output parity verified to the 1e-12 floor)
+- **Bug fix:** mass balance now runs on the clean frames in the sensor-fault validator (a flowrate sensor fault no longer breaks it)
+- **230 tests total**, ruff clean on `src/`, `tests/` and `scripts/`
+
 ### Upcoming
 
-- Phase 5 Week 8: dataset scale generation, matched-baseline leak residual, ML-readiness audit, Hazen-Williams headloss validation.
+- Phase 6 (Weeks 9-10): final report (LaTeX).
 - Phase 6: report writing
 
 ---

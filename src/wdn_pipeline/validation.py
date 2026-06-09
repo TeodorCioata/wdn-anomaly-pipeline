@@ -2,7 +2,7 @@
 
 Per supervisor guidance, validation prioritises physics correctness
 over similarity to existing datasets. Each check returns a
-:class:`ValidationCheck` carrying one of three severities (D12):
+:class:`ValidationCheck` carrying one of three severities:
 
 - ``ok``: clean.
 - ``warning``: a soft anomaly within a configured tolerance band
@@ -687,25 +687,32 @@ def validate_sensor_fault_scenario(
 ) -> ValidationReport:
     """Run normal-scenario checks plus the two structural sensor-fault checks.
 
-    ``finite_values`` is intentionally skipped for the corrupted
-    ``pressure`` / ``flowrate`` frames when dropout faults are present
-    (NaN is the *correct* output there). The clean-signal frames are
-    still validated to catch any genuine simulator NaNs.
+    Mass balance is a physics check, so it always runs on the **clean**
+    (uncorrupted) frames: a ``flowrate`` sensor fault corrupts
+    ``results.flowrate`` and would otherwise break the balance spuriously
+    (this exactly mirrors the cumulative validator). ``finite_values`` is
+    intentionally skipped for the corrupted ``pressure`` / ``flowrate``
+    frames when dropout faults are present (NaN is the *correct* output
+    there); the clean-signal frames are still validated to catch any
+    genuine simulator NaNs. ``pressure_bounds`` runs on the corrupted
+    signal (what the consumer receives) unless dropout NaNs force clean.
     """
+
+    clean_results = SimulationResults(
+        pressure=results.pressure_clean,
+        flowrate=results.flowrate_clean,
+        demand=results.demand,
+        leak_demand=results.leak_demand,
+        elapsed_seconds=results.elapsed_seconds,
+        pressure_clean=results.pressure_clean,
+        flowrate_clean=results.flowrate_clean,
+    )
+    mass_check = _check_mass_balance(wn, clean_results, cfg)
 
     has_dropout = any(f.type == "dropout" for f in resolved_sensor_faults)
     if has_dropout:
         # Validate finiteness on the clean ground-truth signals; the
         # corrupted ones may legitimately contain NaN.
-        clean_results = SimulationResults(
-            pressure=results.pressure_clean,
-            flowrate=results.flowrate_clean,
-            demand=results.demand,
-            leak_demand=results.leak_demand,
-            elapsed_seconds=results.elapsed_seconds,
-            pressure_clean=results.pressure_clean,
-            flowrate_clean=results.flowrate_clean,
-        )
         finite_check = _check_finite(clean_results)
         finite_check = ValidationCheck(
             name=finite_check.name,
@@ -714,11 +721,9 @@ def validate_sensor_fault_scenario(
             + finite_check.detail,
         )
         bounds_check = _check_pressure_bounds(clean_results, cfg)
-        mass_check = _check_mass_balance(wn, clean_results, cfg)
     else:
         finite_check = _check_finite(results)
         bounds_check = _check_pressure_bounds(results, cfg)
-        mass_check = _check_mass_balance(wn, results, cfg)
 
     return ValidationReport(
         checks=[

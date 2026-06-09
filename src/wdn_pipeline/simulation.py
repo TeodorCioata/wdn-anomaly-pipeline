@@ -70,6 +70,19 @@ def run_simulation(wn: WaterNetworkModel) -> SimulationResults:
     elapsed = time.perf_counter() - started
 
     pressure = results.node["pressure"].copy()
+    # A WNTRSimulator run that fails to converge can return a results
+    # object with zero reported timesteps instead of raising. Downstream
+    # validators (np.nanmin etc.) then crash on the empty array with a
+    # cryptic message. Surface it here as a clear, actionable failure so
+    # the batch driver records an informative error per scenario.
+    if pressure.shape[0] == 0:
+        raise RuntimeError(
+            "Simulation produced no reported timesteps: the WNTRSimulator "
+            "returned an empty result, which indicates the hydraulics did "
+            "not converge (commonly an uncalibrated or ill-posed network "
+            "under PDD). Treat this network as incompatible with the current "
+            "simulation settings."
+        )
     flowrate = results.link["flowrate"].copy()
     demand = results.node["demand"].copy()
     if "leak_demand" in results.node:

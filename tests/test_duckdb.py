@@ -81,8 +81,8 @@ def test_single_scenario_writes_duckdb(tmp_path: Path) -> None:
     assert db_path in summary.output_paths
 
     con = duckdb.connect(str(db_path))
-    tables = sorted(r[0] for r in con.execute("SHOW TABLES").fetchall())
-    expected = [
+    tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
+    wide_and_meta = {
         "net3_n_11_demand",
         "net3_n_11_flowrate",
         "net3_n_11_flowrate_clean",
@@ -90,8 +90,16 @@ def test_single_scenario_writes_duckdb(tmp_path: Path) -> None:
         "net3_n_11_pressure",
         "net3_n_11_pressure_clean",
         "scenarios",
-    ]
-    assert tables == expected
+    }
+    long_tables = {
+        "pressure_long",
+        "flowrate_long",
+        "demand_long",
+        "leak_demand_long",
+        "labels_long",
+        "masks_long",
+    }
+    assert tables == wide_and_meta | long_tables
     count = con.execute("SELECT COUNT(*) FROM scenarios").fetchone()[0]
     assert count == 1
 
@@ -264,11 +272,55 @@ def test_duckdb_writer_direct_api(tmp_path: Path) -> None:
         config_path=None,
     )
     con = duckdb.connect(str(db_path))
-    assert {"manual_pressure", "scenarios"} == {
+    long_tables = {
+        "pressure_long",
+        "flowrate_long",
+        "demand_long",
+        "leak_demand_long",
+        "labels_long",
+        "masks_long",
+    }
+    assert {"manual_pressure", "scenarios"} | long_tables == {
         r[0] for r in con.execute("SHOW TABLES").fetchall()
     }
     row_count = con.execute("SELECT COUNT(*) FROM manual_pressure").fetchone()[0]
     assert row_count == 3
+    # The partial tables dict (pressure only, no label) still melts into
+    # pressure_long; labels_long stays empty since there is no label column.
+    assert con.execute("SELECT COUNT(*) FROM pressure_long").fetchone()[0] == 6
+    assert con.execute("SELECT COUNT(*) FROM labels_long").fetchone()[0] == 0
+
+
+def test_duckdb_long_only_skips_wide_tables(tmp_path: Path) -> None:
+    """``wide_tables=False`` (D35) writes long tables + scenarios only."""
+
+    import pandas as pd
+
+    db_path = tmp_path / "long_only.duckdb"
+    df = pd.DataFrame({"10": [1.0, 2.0, 3.0], "15": [4.0, 5.0, 6.0]})
+    df.index.name = "time_seconds"
+    df["label"] = 0
+    DuckDBWriter.write(
+        db_path=db_path,
+        basename="manual",
+        tables={"pressure": df},
+        metadata={
+            "scenario_type": "normal",
+            "network_name": "x",
+            "seed": 1,
+            "fault_summary": {"leaks": [], "sensor_faults": [], "interactions": []},
+        },
+        wide_tables=False,
+    )
+    con = duckdb.connect(str(db_path))
+    tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
+    # No per-scenario wide table; long tables and scenarios still present.
+    assert "manual_pressure" not in tables
+    assert "scenarios" in tables
+    assert "pressure_long" in tables
+    # Long data still landed (3 timesteps x 2 nodes).
+    assert con.execute("SELECT COUNT(*) FROM pressure_long").fetchone()[0] == 6
+    assert con.execute("SELECT COUNT(*) FROM scenarios").fetchone()[0] == 1
 
 
 def test_batch_cli_paths_resolution_works_with_glob(tmp_path: Path) -> None:

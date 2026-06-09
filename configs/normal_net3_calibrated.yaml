@@ -1,0 +1,55 @@
+# Calibrated normal scenario on Net3 (24h, 1h timestep).
+#
+# Demonstrates the Week 8 hydraulic calibration options (decision D33).
+# Every calibration field is optional; omitting one leaves the .inp
+# value untouched. Overrides are logged in the run summary (run with
+# --verbose) and recorded under `calibration_overrides` in the metadata
+# sidecar for provenance.
+#
+# Note (D34): the pipeline always uses WNTRSimulator, which only
+# implements Hazen-Williams headloss. `headloss: D-W`/`C-M` and a real
+# `viscosity` effect would require the EpanetSimulator (no leak support)
+# and are rejected. The options below all demonstrably change
+# WNTRSimulator output (demand_multiplier, the PDD demand curve) or its
+# convergence (accuracy, trials).
+
+network:
+  inp_path: Net3
+  name: net3
+
+simulation:
+  duration_seconds: 86400          # 24 hours
+  hydraulic_timestep_seconds: 3600 # 1 hour
+  report_timestep_seconds: 3600
+  demand_model: PDD                # PDD so the pressure options below are valid
+
+  # --- Calibration allowlist (maps onto wn.options.hydraulic) ---
+  headloss: H-W            # Hazen-Williams (the only formula WNTRSimulator supports)
+  accuracy: 0.0001         # tighter solver convergence accuracy (default 0.001)
+  trials: 100              # more solver trials per timestep (default 40)
+  demand_multiplier: 1.05  # scale every demand by 5% (clear effect on pressure/flow)
+
+  # --- PDD demand-curve calibration (rejected under DDA) ---
+  minimum_pressure: 0.0    # m, below which delivered demand is zero
+  required_pressure: 0.1   # m, at/above which full demand is delivered (default 0.07)
+  pressure_exponent: 0.5   # PDD demand curve exponent (default 0.5)
+
+  # --- Validated passthrough for options outside the allowlist ---
+  # Each key must be a real wn.options.hydraulic attribute or network
+  # prep raises. Demonstrates reaching an exotic solver knob safely.
+  extra_hydraulic_options:
+    checkfreq: 4           # solver status-check frequency (EPANET default 2)
+
+seed: 42
+
+demand:
+  mode: default
+
+scenario:
+  type: normal
+  label: normal_calibrated
+
+output:
+  directory: outputs
+  formats: [parquet, csv]
+  write_metadata_sidecar: true

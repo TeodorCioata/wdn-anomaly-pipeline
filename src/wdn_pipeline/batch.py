@@ -170,6 +170,7 @@ def _classify_status(summary: RunSummary) -> str:
 def _run_one_config(
     config_path: Path,
     duckdb_path_override: Path | None,
+    duckdb_wide_tables: bool = True,
 ) -> BatchRunResult:
     """Run one scenario; safe to call as a worker entry point.
 
@@ -194,6 +195,7 @@ def _run_one_config(
                 update={
                     "duckdb": True,
                     "duckdb_path": Path(duckdb_path_override),
+                    "duckdb_wide_tables": duckdb_wide_tables,
                 }
             )
             cfg = cfg.model_copy(update={"output": updated_output})
@@ -219,6 +221,7 @@ def _run_one_config(
 def _import_run_to_duckdb(
     duckdb_path: Path,
     result: BatchRunResult,
+    wide_tables: bool = True,
 ) -> None:
     """Read parquet outputs for a finished run and append to DuckDB.
 
@@ -279,6 +282,7 @@ def _import_run_to_duckdb(
         metadata=metadata,
         validation_severity=result.summary.validation.severity,
         config_path=str(result.config_path),
+        wide_tables=wide_tables,
     )
 
 
@@ -288,6 +292,7 @@ def run_batch(
     batch_id: str | None = None,
     workers: int = 1,
     duckdb_path: Path | None = None,
+    duckdb_wide_tables: bool = True,
 ) -> BatchSummary:
     """Run a sequence of configs and produce summary artefacts.
 
@@ -328,7 +333,7 @@ def run_batch(
     if workers <= 1:
         for i, config_path in enumerate(config_paths, start=1):
             logger.info("[%d/%d] running %s", i, len(config_paths), config_path)
-            result = _run_one_config(Path(config_path), duckdb_path)
+            result = _run_one_config(Path(config_path), duckdb_path, duckdb_wide_tables)
             if result.status == "error":
                 logger.error(
                     "[%d/%d] %s failed: %s",
@@ -369,7 +374,7 @@ def run_batch(
                     and result.summary is not None
                 ):
                     try:
-                        _import_run_to_duckdb(duckdb_path, result)
+                        _import_run_to_duckdb(duckdb_path, result, duckdb_wide_tables)
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
                             "DuckDB import failed for %s: %s", config_path, exc,

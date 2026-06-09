@@ -169,6 +169,140 @@ def _ensure_scenarios_table(con: duckdb.DuckDBPyConnection) -> None:
     con.execute(SCENARIOS_TABLE_DDL)
 
 
+# Wide table name -> long table name for the value (node/link) tables. The
+# long tables (decision D32, Week 8) are additive: they accumulate every
+# scenario's measurements in (scenario_basename, time_seconds, name,
+# value) form so the query layer can slice across scenarios efficiently
+# without UNION-ing per-scenario wide tables. The clean-signal siblings
+# are intentionally not melted (wide-only) to keep the long tables to the
+# primary signals.
+LONG_VALUE_TABLES = {
+    "pressure": "pressure_long",
+    "flowrate": "flowrate_long",
+    "demand": "demand_long",
+    "leak_demand": "leak_demand_long",
+}
+
+LONG_TABLE_DDLS = {
+    "pressure_long": (
+        "CREATE TABLE IF NOT EXISTS pressure_long "
+        "(scenario_basename VARCHAR, time_seconds BIGINT, name VARCHAR, value DOUBLE)"
+    ),
+    "flowrate_long": (
+        "CREATE TABLE IF NOT EXISTS flowrate_long "
+        "(scenario_basename VARCHAR, time_seconds BIGINT, name VARCHAR, value DOUBLE)"
+    ),
+    "demand_long": (
+        "CREATE TABLE IF NOT EXISTS demand_long "
+        "(scenario_basename VARCHAR, time_seconds BIGINT, name VARCHAR, value DOUBLE)"
+    ),
+    "leak_demand_long": (
+        "CREATE TABLE IF NOT EXISTS leak_demand_long "
+        "(scenario_basename VARCHAR, time_seconds BIGINT, name VARCHAR, value DOUBLE)"
+    ),
+    "labels_long": (
+        "CREATE TABLE IF NOT EXISTS labels_long "
+        "(scenario_basename VARCHAR, time_seconds BIGINT, label TINYINT)"
+    ),
+    "masks_long": (
+        "CREATE TABLE IF NOT EXISTS masks_long "
+        "(scenario_basename VARCHAR, time_seconds BIGINT, mask VARCHAR, value BOOLEAN)"
+    ),
+}
+
+# Indexes on (scenario_basename, name, time_seconds) per decision D32:
+# point/range lookups for one scenario and channel over a time window.
+LONG_TABLE_INDEXES = {
+    "pressure_long": "CREATE INDEX IF NOT EXISTS idx_pressure_long "
+    "ON pressure_long(scenario_basename, name, time_seconds)",
+    "flowrate_long": "CREATE INDEX IF NOT EXISTS idx_flowrate_long "
+    "ON flowrate_long(scenario_basename, name, time_seconds)",
+    "demand_long": "CREATE INDEX IF NOT EXISTS idx_demand_long "
+    "ON demand_long(scenario_basename, name, time_seconds)",
+    "leak_demand_long": "CREATE INDEX IF NOT EXISTS idx_leak_demand_long "
+    "ON leak_demand_long(scenario_basename, name, time_seconds)",
+    "labels_long": "CREATE INDEX IF NOT EXISTS idx_labels_long "
+    "ON labels_long(scenario_basename, time_seconds)",
+    "masks_long": "CREATE INDEX IF NOT EXISTS idx_masks_long "
+    "ON masks_long(scenario_basename, mask, time_seconds)",
+}
+
+
+def _ensure_long_tables(con: duckdb.DuckDBPyConnection) -> None:
+    """Create the consolidated long tables and their indexes on first use."""
+
+    for ddl in LONG_TABLE_DDLS.values():
+        con.execute(ddl)
+    for ddl in LONG_TABLE_INDEXES.values():
+        con.execute(ddl)
+
+
+def _melt_for_long(df: pd.DataFrame, value_cols: list[str], var_name: str, value_name: str) -> pd.DataFrame:
+    """Melt selected columns of a time-indexed table into long form."""
+
+    long_df = (
+        df[value_cols]
+        .rename_axis("time_seconds")
+        .reset_index()
+        .melt(id_vars="time_seconds", var_name=var_name, value_name=value_name)
+    )
+    return long_df
+
+
+def _populate_long_tables(
+    con: duckdb.DuckDBPyConnection, basename: str, tables: dict[str, pd.DataFrame]
+) -> None:
+    """Append one scenario's measurements to the consolidated long tables.
+
+    Idempotent per scenario via DELETE+INSERT, matching the ``scenarios``
+    table convention. Tolerates a partial ``tables`` dict (only the
+    tables present are melted), so the direct writer API and the runner
+    both work. Mask and label columns are excluded from the value long
+    tables and routed to ``masks_long`` / ``labels_long`` respectively.
+    """
+
+    def _insert(long_table: str, long_df: pd.DataFrame) -> None:
+        long_df = long_df.copy()
+        long_df.insert(0, "scenario_basename", basename)
+        con.execute(f"DELETE FROM {long_table} WHERE scenario_basename = ?", [basename])
+        con.register("_wdn_long_tmp", long_df)
+        con.execute(f"INSERT INTO {long_table} SELECT * FROM _wdn_long_tmp")
+        con.unregister("_wdn_long_tmp")
+
+    for wide_name, long_table in LONG_VALUE_TABLES.items():
+        if wide_name not in tables:
+            continue
+        df = tables[wide_name]
+        value_cols = [c for c in df.columns if c != "label" and "_mask_" not in c]
+        if not value_cols:
+            continue
+        _insert(long_table, _melt_for_long(df, value_cols, "name", "value"))
+
+    # Labels: identical across tables; take from whichever value table
+    # carries a label column (pressure first).
+    for candidate in ("pressure", "flowrate", "demand"):
+        df = tables.get(candidate)
+        if df is not None and "label" in df.columns:
+            labels_df = df[["label"]].rename_axis("time_seconds").reset_index()
+            _insert("labels_long", labels_df)
+            break
+
+    # Masks: melt any per-channel mask columns from the corrupted tables.
+    mask_frames: list[pd.DataFrame] = []
+    for candidate in ("pressure", "flowrate"):
+        df = tables.get(candidate)
+        if df is None:
+            continue
+        mask_cols = [c for c in df.columns if "_mask_" in c]
+        if mask_cols:
+            mask_frames.append(_melt_for_long(df, mask_cols, "mask", "value"))
+    if mask_frames:
+        _insert("masks_long", pd.concat(mask_frames, ignore_index=True))
+    else:
+        # Keep the table idempotent even when a re-run removes all masks.
+        con.execute("DELETE FROM masks_long WHERE scenario_basename = ?", [basename])
+
+
 def _upsert_scenario_row(
     con: duckdb.DuckDBPyConnection,
     basename: str,
@@ -222,10 +356,10 @@ class DuckDBWriter:
     The writer is independent of :class:`Writer` because its lifetime
     spans multiple scenarios (one DB file accumulates the whole batch)
     and it needs a target DB path that is not part of the per-scenario
-    output directory contract. It honours decision D30: every scenario's
-    tables are materialised into the same DuckDB file, namespaced by
-    ``{basename}_{table_name}``. A ``scenarios`` metadata table carries
-    one row per scenario for cross-scenario queries.
+    output directory contract. Every scenario's tables are materialised
+    into the same DuckDB file, namespaced by ``{basename}_{table_name}``.
+    A ``scenarios`` metadata table carries one row per scenario for
+    cross-scenario queries.
 
     DuckDB does not support concurrent writers across processes; the
     batch driver (:mod:`wdn_pipeline.batch`) serialises DuckDB writes in
@@ -242,6 +376,7 @@ class DuckDBWriter:
         metadata: dict,
         validation_severity: str | None = None,
         config_path: str | None = None,
+        wide_tables: bool = True,
     ) -> Path:
         """Materialise ``tables`` into ``db_path`` under ``basename``.
 
@@ -258,6 +393,11 @@ class DuckDBWriter:
                 ``scenarios`` row.
             config_path: Optional config path recorded into the
                 ``scenarios`` row for traceability.
+            wide_tables: When true (default, D30) write the per-scenario
+                wide tables. When false (D35) write only the consolidated
+                long tables and the ``scenarios`` row, keeping a large
+                consolidated file compact (each wide table otherwise
+                costs a DuckDB storage block).
 
         Returns:
             ``db_path`` as a :class:`Path`.
@@ -267,18 +407,21 @@ class DuckDBWriter:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         with duckdb.connect(str(db_path)) as con:
             _ensure_scenarios_table(con)
-            for table_name, df in tables.items():
-                full_table = f"{basename}_{table_name}"
-                df_to_write = df.reset_index().rename(
-                    columns={"index": "time_seconds"}
-                )
-                con.register("_wdn_pipeline_tmp_df", df_to_write)
-                con.execute(f'DROP TABLE IF EXISTS "{full_table}"')
-                con.execute(
-                    f'CREATE TABLE "{full_table}" AS '
-                    "SELECT * FROM _wdn_pipeline_tmp_df"
-                )
-                con.unregister("_wdn_pipeline_tmp_df")
+            _ensure_long_tables(con)
+            if wide_tables:
+                for table_name, df in tables.items():
+                    full_table = f"{basename}_{table_name}"
+                    df_to_write = df.reset_index().rename(
+                        columns={"index": "time_seconds"}
+                    )
+                    con.register("_wdn_pipeline_tmp_df", df_to_write)
+                    con.execute(f'DROP TABLE IF EXISTS "{full_table}"')
+                    con.execute(
+                        f'CREATE TABLE "{full_table}" AS '
+                        "SELECT * FROM _wdn_pipeline_tmp_df"
+                    )
+                    con.unregister("_wdn_pipeline_tmp_df")
+            _populate_long_tables(con, basename, tables)
             _upsert_scenario_row(
                 con, basename, metadata, validation_severity, config_path
             )
@@ -371,6 +514,7 @@ def write_outputs(
     duckdb_path: Path | None = None,
     validation_severity: str | None = None,
     config_path: str | None = None,
+    duckdb_wide_tables: bool = True,
 ) -> WriteResult:
     """Write tables in every requested format plus an optional sidecar.
 
@@ -396,6 +540,7 @@ def write_outputs(
             metadata=metadata,
             validation_severity=validation_severity,
             config_path=config_path,
+            wide_tables=duckdb_wide_tables,
         )
         data_paths.append(db_path)
 

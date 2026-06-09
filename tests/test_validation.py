@@ -17,6 +17,53 @@ from wdn_pipeline.validation import (
 )
 
 
+def test_flowrate_sensor_fault_mass_balance_uses_clean(tmp_path) -> None:
+    """A flowrate sensor fault must not break the mass-balance check.
+
+    Regression: mass balance is a physics check and must run on the
+    clean (uncorrupted) flowrate. A flowrate bias corrupts
+    ``results.flowrate``; validating mass balance on the corrupted frame
+    spuriously fails it. The fix routes mass balance to the clean frames
+    in the sensor-fault validator, matching the cumulative validator.
+    """
+
+    from wdn_pipeline.config import PipelineConfig
+    from wdn_pipeline.runner import run
+
+    cfg = PipelineConfig.model_validate(
+        {
+            "network": {"inp_path": "Net3", "name": "net3"},
+            "simulation": {
+                "duration_seconds": 6 * 3600,
+                "hydraulic_timestep_seconds": 3600,
+                "report_timestep_seconds": 3600,
+            },
+            "seed": 3,
+            "scenario": {"type": "sensor_fault", "label": "flow_bias"},
+            "faults": {
+                "sensor_faults": [
+                    {
+                        "type": "bias",
+                        "quantity": "flowrate",
+                        "bias_value": 0.5,  # large enough to wreck a corrupted balance
+                        "start_time_seconds": 3600,
+                        "end_time_seconds": 18000,
+                    }
+                ]
+            },
+            "output": {
+                "directory": str(tmp_path / "out"),
+                "formats": ["parquet"],
+                "write_metadata_sidecar": False,
+            },
+        }
+    )
+    summary = run(cfg)
+    mass = next(c for c in summary.validation.checks if c.name == "mass_balance")
+    assert mass.severity == "ok", mass.detail
+    assert summary.validation.severity != "fail"
+
+
 @pytest.fixture
 def net3_results() -> tuple:
     cfg = SimulationConfig(

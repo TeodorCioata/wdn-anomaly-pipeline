@@ -30,7 +30,6 @@ import pandas as pd
 from matplotlib.figure import Figure
 
 from wdn_pipeline.config import (
-    NetworkConfig,
     PipelineConfig,
     SimulationConfig,
     load_config,
@@ -40,10 +39,6 @@ from wdn_pipeline.faults.leak import LeakInjector
 from wdn_pipeline.network import load_network
 from wdn_pipeline.runner import RunSummary, run
 from wdn_pipeline.simulation import SimulationResults, run_simulation
-from wdn_pipeline.validation import (
-    validate_leak_scenario,
-    validate_normal_scenario,
-)
 
 logging.basicConfig(level=logging.WARNING)
 
