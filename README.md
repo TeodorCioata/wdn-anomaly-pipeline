@@ -1,6 +1,6 @@
 # WDN Anomaly Pipeline
 
-A modular, configuration-driven Python pipeline that wraps [EPANET/WNTR](https://usepa.github.io/WNTR/) to systematically generate large-scale, labelled time-series datasets for water distribution networks (WDNs). The pipeline covers normal baseline scenarios, pipe leaks (abrupt and incipient), sensor faults (bias, drift, stuck, dropout, noise, gain) and cumulative anomalies (leak plus sensor faults in one scenario), producing reproducible, ML-ready datasets in Parquet and CSV formats.
+A modular, configuration-driven Python pipeline that wraps [EPANET/WNTR](https://usepa.github.io/WNTR/) to systematically generate large-scale, labelled time-series datasets for water distribution networks (WDNs). The pipeline covers normal baseline scenarios, pipe leaks (abrupt and incipient), sensor faults (bias, drift, stuck, dropout, noise, gain) and cumulative anomalies (leak plus sensor faults in one scenario), producing reproducible, ML-ready datasets in Parquet, CSV and DuckDB formats. A batch driver runs many configs sequentially or via a `ProcessPoolExecutor` worker pool.
 
 **MSc internship project** — Teodor Cioata, MSc Computing Science, University of Groningen, 2026.
 Supervisors: Dilek Düştegör, Alexander Lazovik, Samer Ahmed.
@@ -22,10 +22,11 @@ wdn-anomaly-pipeline/
 │       ├── simulation.py    # WNTR simulation wrapper
 │       ├── labelling.py     # Per-timestep labels + scenario metadata
 │       ├── validation.py    # Physics-based validation (PASS/WARNING/FAIL)
-│       ├── output.py        # Extensible writer interface (parquet, csv, ...)
-│       ├── postprocess.py   # Optional leak-node cleanup (D28)
+│       ├── output.py        # Writer registry (parquet, csv, DuckDB)
+│       ├── postprocess.py   # Optional leak-node cleanup
+│       ├── batch.py         # Batch driver (sequential + ProcessPoolExecutor)
 │       ├── runner.py        # End-to-end orchestrator + Typer CLI
-│       └── faults/          # Leak and sensor fault injectors 
+│       └── faults/          # Leak and sensor fault injectors
 ├── notebooks/        # Jupyter exploration notebooks
 ├── tests/            # pytest unit and integration tests
 ├── outputs/          # Generated datasets and plots (gitignored)
@@ -49,10 +50,14 @@ source .venv/bin/activate
 
 # 3. Install the package and dev dependencies
 pip install -e ".[dev]"
+# Optional: the PyTorch ML loader (wdn_pipeline.ml)
+# pip install -e ".[dev,ml]"
 
 # 4. Verify WNTR is working
 python -c "import wntr; print('wntr', wntr.__version__)"
 ```
+
+The runtime dependencies (including a `numpy<2.4` cap to avoid an X86_V2-baseline crash on older CPUs) are declared in `pyproject.toml`, so a plain `pip install .` is enough to run the pipeline and CLI. The bundled WNTR networks (e.g. `Net3`, `Hanoi`) resolve by name; additional `.inp` files (FOWM, Jilin, the LeakG3PD set) are not committed and must be placed under `networks/`.
 
 ---
 
@@ -60,12 +65,31 @@ python -c "import wntr; print('wntr', wntr.__version__)"
 
 ### CLI
 
-The package installs a `wdn-pipeline` console script (Typer-based, decision D8). Pass a YAML config and an optional `--verbose` flag:
+The package installs a `wdn-pipeline` console script (Typer-based). The CLI exposes two subcommands plus a backwards-compatible legacy form:
 
 ```bash
+# Single config (legacy form — still works, routed via the _DefaultCommandGroup)
 wdn-pipeline configs/normal_net3.yaml
 wdn-pipeline configs/normal_hanoi.yaml --verbose
+
+# Single config (explicit subcommand, equivalent to the legacy form)
+wdn-pipeline run configs/normal_net3.yaml
+
+# Batch (Phase 4 Week 6)
+wdn-pipeline batch configs/cumulative_*.yaml
+wdn-pipeline batch --config-dir configs/
+wdn-pipeline batch --config-dir configs/ --glob "leak_*.yaml" \
+    --report-dir outputs/my_batch
+
+# Parallel batch (Phase 5 Week 7): ProcessPoolExecutor with spawn
+wdn-pipeline batch --config-dir configs/ --workers 4
+
+# Consolidated DuckDB export across the whole batch
+wdn-pipeline batch --config-dir configs/ --duckdb outputs/pipeline.duckdb
+wdn-pipeline batch --config-dir configs/ --workers 4 --duckdb outputs/pipeline.duckdb
 ```
+
+The batch driver isolates per-config failures: a single broken config does not abort the batch. Exit code is 1 if any run had severity `fail` or threw an exception, 0 otherwise. Parallel mode (`--workers > 1`) uses `multiprocessing.get_context("spawn")` so workers start with a clean WNTR state; DuckDB writes are funnelled through the main process so the shared file never sees concurrent writers.
 
 ### Python API
 
@@ -78,7 +102,7 @@ print("output files:", summary.output_paths)
 print("validation severity:", summary.validation.severity)
 ```
 
-`summary.validation.severity` is one of `"ok"`, `"warning"`, `"fail"` (decision D12).
+`summary.validation.severity` is one of `"ok"`, `"warning"`, `"fail"`.
 
 ---
 
@@ -97,6 +121,27 @@ simulation:
   report_timestep_seconds: 3600
   pattern_timestep_seconds: 3600  # optional; defaults to .inp value
   demand_model: DDA           # DDA | PDD
+  # --- Calibration options (Week 8). All optional; omit = .inp value kept ---
+  headloss: H-W               # H-W only (WNTRSimulator is Hazen-Williams)
+  viscosity: 1.0              # relative kinematic viscosity (inert under H-W)
+  specific_gravity: 1.0
+  accuracy: 0.001             # solver convergence accuracy
+  trials: 40                  # max solver trials per timestep
+  demand_multiplier: 1.0      # global demand scale
+  minimum_pressure: 0.0       # PDD only
+  required_pressure: 0.07     # PDD only
+  pressure_exponent: 0.5      # PDD only
+  extra_hydraulic_options: {} # validated passthrough for non-allowlist options
+  # --- Water quality (optional). parameter: none = no quality analysis ---
+  quality:
+    parameter: none           # none | chemical | age | trace
+    trace_node: null          # required when parameter: trace
+    chemical_name: null       # chemical only
+    diffusivity: null         # chemical only
+    bulk_coeff: null          # chemical only, per-second (negative = decay)
+    wall_coeff: null          # chemical only
+    quality_timestep_seconds: null
+    sources: []               # chemical only: list of injection sources
 
 seed: 42
 
@@ -125,13 +170,16 @@ validation:
   pressure_max_m: 150.0
   mass_balance_tol_m3s: 1.0e-3
   leak_pressure_drop_min_m: 0.01          # warning floor for leak-aware drop check
-  gain_detectability_min_ratio: 0.05      # gain-fault detectability floor (D27)
+  gain_detectability_min_ratio: 0.05      # gain-fault detectability floor
 
 output:
   directory: outputs
   formats: [parquet, csv]     # one or both
   write_metadata_sidecar: true
-  remove_leak_nodes: false    # D28: revert leak-node split artefacts on output
+  remove_leak_nodes: false    # revert leak-node split artefacts on output
+  duckdb: false               # also write to a consolidated DuckDB file
+  duckdb_path: null           # required when duckdb=true
+  duckdb_wide_tables: true    # include per-scenario wide tables (false = long-only)
 ```
 
 ### Demand modes
@@ -142,9 +190,128 @@ output:
 
 Adding a new strategy means subclassing `DemandStrategy` in `demand.py` and registering it in `STRATEGIES`.
 
+### Simulation calibration options (Phase 5 Week 8)
+
+The LeakG3PD paper names per-network calibration as a limitation. The pipeline exposes WNTR's `wn.options.hydraulic` surface so simulations can be calibrated per network. Strategy: a typed allowlist of common options plus a validated `extra_hydraulic_options` passthrough. Every field is optional and defaults to `None` meaning "leave the .inp value untouched" — important because some networks ship their own calibrated values. Each applied override is logged in the run summary (`--verbose`) and recorded under `calibration_overrides` in the metadata sidecar for provenance.
+
+| Option | WNTR meaning | Unit | Default |
+|---|---|---|---|
+| `viscosity` | Kinematic viscosity relative to water at 20 C. Affects Darcy-Weisbach headloss only | dimensionless | 1.0 |
+| `specific_gravity` | Fluid specific gravity relative to water | dimensionless | 1.0 |
+| `headloss` | Headloss formula: `H-W`, `D-W` or `C-M` | enum | `H-W` |
+| `accuracy` | Solver convergence accuracy | dimensionless | 0.001 |
+| `trials` | Maximum solver trials per timestep | count | 40 |
+| `demand_multiplier` | Global multiplier applied to all demands | dimensionless | 1.0 |
+| `minimum_pressure` | PDD lower pressure bound below which demand is zero | m | 0.0 |
+| `required_pressure` | PDD pressure at/above which full demand is delivered | m | 0.07 |
+| `pressure_exponent` | PDD demand-curve exponent | dimensionless | 0.5 |
+| `extra_hydraulic_options` | Map of any other `wn.options.hydraulic` attribute to a value; unknown keys raise at network prep | dict | `{}` |
+
+Two guards apply:
+
+- **PDD-only options** (`minimum_pressure`, `required_pressure`, `pressure_exponent`) are rejected at config load under `demand_model: DDA` — EPANET silently ignores them there, so setting them is a likely mistake.
+- **Headloss formula** : the pipeline always uses `WNTRSimulator` (for leak + PDD support), which only implements Hazen-Williams. `headloss: D-W`/`C-M` is rejected at network prep with a clear message and `viscosity` (which only affects Darcy-Weisbach) is inert under WNTRSimulator. Darcy-Weisbach calibration would require the `EpanetSimulator`, which has no leak support.
+
+See `configs/normal_net3_calibrated.yaml` for a worked example. Run it with `--verbose` to see the override log.
+
+### Water quality options
+
+The pipeline can run a water quality analysis (chemical concentration, water age or source trace) on top of the hydraulics. Water quality runs through WNTR's `EpanetSimulator`: the `WNTRSimulator` used everywhere else (for leak and PDD support) produces no quality output at all. Because the `EpanetSimulator` has no leak support, **water quality and leaks are mutually exclusive** — a config with both `simulation.quality` enabled and a non-empty `faults.leaks` is rejected at config load with a clear message. When quality is requested, the whole scenario (hydraulics included) is solved by EPANET, so the pressure/flowrate/demand tables for that run come from EPANET. The existing leak / sensor / cumulative paths are unaffected.
+
+Enable a quality analysis with the `simulation.quality` block. `parameter: none` (the default) leaves the pipeline exactly as it was.
+
+| Option | WNTR meaning | Unit | Valid when |
+|---|---|---|---|
+| `parameter` | `none` (off), `chemical` (reactive species), `age` (residence time), `trace` (percent of flow from a node) | enum | always |
+| `trace_node` | Source node whose flow is traced | node name | required for `trace`, rejected otherwise |
+| `chemical_name` | Display name of the tracked species | string | `chemical` only |
+| `diffusivity` | Molecular diffusivity relative to chlorine in water | dimensionless | `chemical` only |
+| `bulk_coeff` | Bulk reaction coefficient, **per second** (converted to EPANET 1/day on write); negative = decay | 1/s | `chemical` only |
+| `wall_coeff` | Wall reaction coefficient | 1/s or m/s | `chemical` only |
+| `sources` | Chemical injection sources: each has `node`, `source_type` (`CONCEN`/`MASS`/`FLOWPACED`/`SETPOINT`), `strength` and an optional `pattern` (list of multipliers) | list | `chemical` only |
+| `quality_timestep_seconds` | Water quality timestep | s | any analysis (rejected under `none`) |
+
+The result is written as an extra `quality` output table (Parquet/CSV) alongside the hydraulic tables, with units following the analysis: mg/L for chemical, **seconds** for age, percent for trace. It is queryable through the same long-table layer (`DatasetQuery.quality(...)` and `wdn-pipeline query --quantity quality`). The settings actually applied are logged in the run summary (`--verbose`) and recorded under `water_quality` in the metadata sidecar for provenance. Node references (`trace_node`, source nodes) are validated against the loaded network.
+
+```yaml
+simulation:
+  demand_model: DDA
+  quality:
+    parameter: chemical
+    chemical_name: chlorine
+    bulk_coeff: -0.00001157   # ~ -1.0/day decay
+    sources:
+      - node: River
+        source_type: CONCEN
+        strength: 1.0         # 1.0 mg/L at the reservoir
+```
+
+See `configs/normal_net3_chemical.yaml` (chlorine decay) and `configs/normal_net3_age.yaml` (water age) for worked examples.
+
 ### Output writers
 
-`parquet` and `csv` ship out of the box. Each writer subclasses `Writer` in `output.py` and is registered in `WRITERS`. Adding DuckDB later (planned) is purely additive: a new subclass and registry entry, no other code changes.
+`parquet` and `csv` ship as classic `Writer` subclasses registered in `WRITERS`. A third backend, `DuckDBWriter`, is invoked separately from the `formats` list because it needs a target file path (`output.duckdb_path`) and is intended to span multiple scenarios. Set `output.duckdb: true` plus a `duckdb_path` to write per-scenario tables into a shared DuckDB file under the `{basename}_{table_name}` namespace; a `scenarios` metadata table carries one row per scenario for cross-scenario queries. The batch CLI's `--duckdb PATH` flag overrides any per-config setting and consolidates the whole batch into one file.
+
+```python
+import duckdb
+
+con = duckdb.connect("outputs/pipeline.duckdb")
+con.sql("SHOW TABLES").show()
+con.sql(
+    "SELECT scenario_basename, validation_severity, num_leaks, num_sensor_faults "
+    "FROM scenarios ORDER BY scenario_basename"
+).show()
+con.sql('SELECT * FROM "net3_cumulative_leak_bias_42_pressure" LIMIT 5').show()
+```
+
+### Querying a dataset: partial retrieval (Phase 5 Week 8)
+
+Experiment outputs are large, so consumers should retrieve **slices** rather than whole datasets. The DuckDB writer materialises, alongside the per-scenario wide tables, a set of consolidated **long tables** that accumulate every scenario's measurements for efficient cross-scenario slicing:
+
+| Long table | Columns |
+|---|---|
+| `pressure_long` / `flowrate_long` / `demand_long` / `leak_demand_long` / `quality_long` | `scenario_basename, time_seconds, name, value` |
+| `labels_long` | `scenario_basename, time_seconds, label` |
+| `masks_long` | `scenario_basename, time_seconds, mask, value` |
+
+Each is indexed on `(scenario_basename, name, time_seconds)`. The wide per-scenario tables are kept for whole-scenario export; the long tables are additive.
+
+For large consolidated batches, build the file **long-only** to keep it compact: the per-scenario wide tables cost DuckDB a storage block each, so a 520-scenario file is ~205 MB long-only versus ~1.6 GB with the wide tables, and writes in a fraction of the time. Use `wdn-pipeline batch ... --duckdb PATH --duckdb-long-only` (or `output.duckdb_wide_tables: false` for a single run). The query layer slices the long tables either way; whole-scenario flat export stays in the Parquet/CSV tree.
+
+`wdn_pipeline.query.DatasetQuery` wraps a read-only DuckDB connection with parametrised slice methods. Filters are optional and composable (`None` = all); time windows are half-open `[t_start, t_end)`; `wide=True` pivots back to the timestep x channel matrix for ML use. All values are bound (never string-interpolated), so a node name is always treated as data.
+
+```python
+from wdn_pipeline.query import DatasetQuery
+
+with DatasetQuery("outputs/scale_run.duckdb") as q:
+    q.scenarios(scenario_type="leak", network="net3")            # browse the catalogue
+    q.pressure(scenario="net3_leak_5", nodes=["10", "15"],       # one scenario, two nodes,
+               t_start=21600, t_end=64800)                       #   6h window (long form)
+    q.pressure(scenarios=net3_leaks, nodes=["10"])               # one node across many scenarios
+    q.pressure(scenario="net3_leak_5", nodes=["10"], wide=True)  # timestep x node matrix
+    q.labels(scenario="net3_leak_5", label=1)                    # only anomalous timesteps
+    q.masks(scenario="net3_sensor_bias_3")                       # per-channel sensor masks
+    q.flowrate(scenario="net3_leak_5", links=["10"])             # link-addressed
+    q.quality(scenario="net3_normal_age_42", nodes=["20"])       # water quality (if present)
+    q.sql("SELECT ... FROM pressure_long WHERE ...")             # raw SQL escape hatch
+```
+
+A `wdn-pipeline query` CLI subcommand reuses the same builder for shell-level slices into CSV or Parquet:
+
+```bash
+# Browse the catalogue
+wdn-pipeline query outputs/scale_run.duckdb --list-scenarios
+
+# One scenario, named nodes, a time window, to CSV
+wdn-pipeline query outputs/scale_run.duckdb --quantity pressure \
+    --scenario net3_leak_5 --nodes 10,15 --t-start 21600 --t-end 64800 --out slice.csv
+
+# One node across every leak scenario, to Parquet
+wdn-pipeline query outputs/scale_run.duckdb --quantity pressure \
+    --scenario-type leak --nodes 15 --out leaks_node15.parquet
+```
+
+`--nodes`, `--links` and `--names` are aliases for the same channel filter. See `notebooks/02_query_demo.ipynb` for a runnable walkthrough.
 
 ### Validation severity
 
@@ -166,7 +333,7 @@ Per-timestep labels and the `leak_demand_active` check both use a **half-open ac
 
 ### Leak scenarios
 
-Add a list of `LeakSpec` entries under `faults.leaks`. Leaks require `simulation.demand_model: PDD` (D16) — the config validator rejects `DDA + leaks` outright with no silent auto-promotion.
+Add a list of `LeakSpec` entries under `faults.leaks`. Leaks require `simulation.demand_model: PDD` — the config validator rejects `DDA + leaks` outright with no silent auto-promotion.
 
 ```yaml
 simulation:
@@ -208,7 +375,7 @@ faults:
 
 ### Sensor fault scenarios (Phase 4 Week 4)
 
-Sensor faults corrupt the reported pressure or flowrate at a single channel **after** the hydraulic simulation has run (decision D5). The simulator output is preserved verbatim in `pressure_clean` / `flowrate_clean` so downstream consumers always have the uncorrupted ground truth.
+Sensor faults corrupt the reported pressure or flowrate at a single channel **after** the hydraulic simulation has run. The simulator output is preserved verbatim in `pressure_clean` / `flowrate_clean` so downstream consumers always have the uncorrupted ground truth.
 
 ```yaml
 faults:
@@ -244,22 +411,22 @@ For true reading `y(t)` over the half-open window `[start, end)`:
 | `noise` | `y'(t) = y(t) + epsilon`, `epsilon ~ N(0, sigma^2)` |
 | `gain` | `y'(t) = gain_factor * y(t)` |
 
-#### Gain fault detectability (D27)
+#### Gain fault detectability
 
 A gain factor very close to `1.0` corrupts low-variance channels by an amount comparable to ordinary sensor noise, which would mislabel ML training data. After applying the gain the `sensor_fault_signal_applied` check compares the residual standard deviation to the clean-signal standard deviation; below `validation.gain_detectability_min_ratio` (default `0.05`) it emits a **warning** (never a hard failure). The config validator also rejects `gain_factor` of exactly `1.0` (a no-op) or `0.0` (zeroes the signal).
 
-#### Random target selection (D19)
+#### Random target selection
 
 Set `target: null` to draw a target from the scenario RNG. Pressure faults sample from `wn.junction_name_list`; flowrate faults sample from `wn.pipe_name_list`. Random draws are reproducible: the same seed always picks the same target.
 
 #### Output layout for sensor scenarios
 
-- `*_pressure` and `*_flowrate` tables: corrupted signals, with the per-channel mask columns `{fault_type}_mask_{target}` appended (decision D26).
+- `*_pressure` and `*_flowrate` tables: corrupted signals, with the per-channel mask columns `{fault_type}_mask_{target}` appended.
 - `*_pressure_clean` and `*_flowrate_clean` tables: uncorrupted simulator output, identical to the corrupted siblings when no sensor faults run.
-- The sidecar metadata YAML records every resolved sensor fault under `fault_summary.sensor_faults` (long-form event list, source of truth per D22).
+- The sidecar metadata YAML records every resolved sensor fault under `fault_summary.sensor_faults` (long-form event list, the source of truth).
 - Per-timestep `label` is the **union** of every active leak + sensor fault window.
 
-#### Validation (D23)
+#### Validation
 
 Two new structural checks run for any scenario that includes sensor faults:
 
@@ -268,7 +435,7 @@ Two new structural checks run for any scenario that includes sensor faults:
 | `sensor_fault_mask_consistent` | per-channel mask covers exactly `[start, end)` (or, for dropout, the sub-intervals) | mask disagrees with the spec at any timestep |
 | `sensor_fault_signal_applied` | corrupted minus clean matches the fault formula to numerical tolerance (for noise: residual mean within `4*sigma/sqrt(n)` and std within 30% of sigma) | residual deviates from the spec |
 
-`sensor_fault_signal_applied` can also emit a `warning` for the gain detectability check (D27) without failing.
+`sensor_fault_signal_applied` can also emit a `warning` for the gain detectability check without failing.
 
 #### Example sensor configs
 
@@ -297,13 +464,39 @@ A cumulative scenario carries **both** `faults.leaks` and `faults.sensor_faults`
 | `configs/cumulative_leak_noise_fowm.yaml` | Random-location leak plus a noise sensor on FOWM |
 | `configs/cumulative_leak_gain_net3.yaml` | Abrupt leak plus a gain sensor on Net3 |
 
-### Leak-node cleanup (D28)
+### Leak-node cleanup
 
-Injecting a leak splits a pipe and inserts a new junction, so a leak scenario's output schema gains a leak-node column and an extra pipe segment relative to a normal scenario. Setting `output.remove_leak_nodes: true` runs an optional post-processing step that reverts these artefacts: leak-node columns are dropped from the node tables, the upstream split-segment flow column is dropped and the downstream segment is renamed back to the original pipe name. The `leak_demand` diagnostic table is never touched. With cleanup enabled the output column schema matches the original network exactly. The default is `false` (explicit opt-in). See `configs/leak_abrupt_net3_clean.yaml` for a worked example and `docs/supervisor_leak_cleanup_reference.py` for the supervisor's reference logic.
+Injecting a leak splits a pipe and inserts a new junction, so a leak scenario's output schema gains a leak-node column and an extra pipe segment relative to a normal scenario. Setting `output.remove_leak_nodes: true` runs an optional post-processing step that reverts these artefacts: leak-node columns are dropped from the node tables, the upstream split-segment flow column is dropped and the downstream segment is renamed back to the original pipe name. The `leak_demand` diagnostic table is never touched. With cleanup enabled the output column schema matches the original network exactly. The default is `false` (explicit opt-in). See `configs/leak_abrupt_net3_clean.yaml` for a worked example.
 
 ### PDD normal scenarios
 
 From Week 5 onwards the project default for normal scenarios is the pressure-dependent demand model. The `configs/normal_*_pdd.yaml` configs are the PDD counterparts of the DDA `normal_*` configs (kept for reference). Under PDD the simulator reduces delivered demand as pressure falls instead of forcing flow at negative pressure. Note that PDD does **not** remove the known Net3 node "10" negative-pressure dip: node "10" carries no consumer demand, so the dip is a pure elevation/topology artefact that is bit-identical under DDA and PDD.
+
+### ML loader (optional)
+
+`wdn_pipeline.ml` provides a ready PyTorch dataset over a pipeline DuckDB file plus a leakage-free train/test split. PyTorch is an optional dependency (the `ml` extra: `pip install -e ".[ml]"`); the split helper works without it.
+
+- `scenario_train_test_split(scenarios, test_fraction=0.2, seed=0)` splits a list of scenario basenames **at the scenario level** using a stable hash, so windows from one scenario never leak across the train/test boundary. The same scenarios and seed always give the same split.
+- `WDNWindowDataset(db_path, scenarios, quantity="pressure", channels=None, window_length=24, stride=1)` is a `torch.utils.data.Dataset` of fixed-length sliding windows over one quantity. Each item is `(window, label)`: a `float32` tensor of shape `(window_length, n_channels)` and a window-level anomaly label (`1.0` if any timestep in the window is anomalous). Windows never cross a scenario boundary.
+
+```python
+from wdn_pipeline.query import DatasetQuery
+from wdn_pipeline.ml import scenario_train_test_split, WDNWindowDataset
+
+with DatasetQuery("outputs/scale_run.duckdb") as q:
+    all_scenarios = list(q.scenarios()["scenario_basename"])
+train, test = scenario_train_test_split(all_scenarios, test_fraction=0.2, seed=0)
+
+train_ds = WDNWindowDataset("outputs/scale_run.duckdb", train, window_length=24)
+# from torch.utils.data import DataLoader; DataLoader(train_ds, batch_size=64, shuffle=True)
+```
+
+## Known limitations
+
+- **WNTRSimulator is Hazen-Williams only.** The pipeline always uses WNTR's pure-Python simulator (the only one with leak + PDD support), which does not implement Darcy-Weisbach or Chezy-Manning headloss. `headloss: D-W`/`C-M` is rejected at network prep and `viscosity` is inert. Darcy-Weisbach calibration would need the EpanetSimulator, which has no leak support.
+- **Water quality and leaks are mutually exclusive.** Water quality runs through the EpanetSimulator (the WNTRSimulator emits no quality table), which cannot model leaks. A config combining `simulation.quality` with `faults.leaks` is rejected at config load.
+- **Uncalibrated networks may produce physically plausible warnings.** Some bundled networks (e.g. Net3 node "10") produce small negative pressures that are documented warnings, not failures. Per-network calibration via the `simulation` options can address these where the .inp supports it.
+- **Network size ceiling.** The pure-Python WNTRSimulator is slow on very large networks; the LeakG3PD sweep caps at ~2000 junctions.
 
 ---
 
@@ -313,30 +506,43 @@ From Week 5 onwards the project default for normal scenarios is the pressure-dep
 pytest
 ```
 
-Currently 157 tests covering every module: config schema (with leak-spec and sensor-fault validators), network loading, demand strategies, simulation, leak injection (abrupt + linear + multi), sensor fault injection (bias / drift / stuck / dropout / noise / gain), leak-node cleanup post-processing, cumulative scenarios, PDD normal scenarios, labelling, validation severity (leak-aware mass balance, leak demand active, sensor fault mask consistency, sensor fault signal applied, gain detectability), output writers, and end-to-end runner determinism.
+Currently **280 tests** covering every module: config schema (with leak-spec, sensor-fault discriminated union incl. unknown-type and foreign-field rejection, calibration, water-quality and DuckDB invariants), network loading, hydraulic calibration options (allowlist + validated passthrough, PDD-only and D-W guards), water quality (chemical / age / trace, leak+quality rejection, EpanetSimulator routing, quality plausibility bounds), demand strategies, simulation (the empty-result and `error_code` non-convergence guards), leak injection (abrupt + linear + multi, including two leaks on one pipe), sensor fault injection (bias / drift / stuck / dropout / noise / gain, including multiple faults on one channel), leak-node cleanup post-processing, cumulative scenarios, PDD normal scenarios, labelling, validation severity (leak-aware mass balance run on clean frames, leak demand active, sensor fault mask consistency, sensor fault signal applied with n-aware noise tolerance, gain detectability, water-quality plausibility), output writers, DuckDB single-scenario / batch / round-trip / idempotency / long-table population, the `DatasetQuery` query layer and `wdn-pipeline query` CLI (slicing, half-open windows, wide round-trip, read-only safety, parametrised-binding injection safety), the ML loader (scenario-level split, windowed dataset with an eager-load cap), the CLI command routing (legacy + subcommand forms), the LeakG3PD network sweep smoke tests, organise-outputs categorisation and README rendering, batch driver (sequential + parallel parity, duplicate-basename guard) and end-to-end runner determinism.
 
 ---
 
-## Generating the Phase 3 Plots
+## Generating the Phase 4 Plots
 
-After at least one successful pipeline run:
+The definitive Phase 4 plot script re-runs every config and writes 11 plots plus a per-config validation summary to `outputs/plots/`:
 
 ```bash
-python scripts/generate_phase3_plots.py
+python scripts/generate_phase4_plots.py
 ```
 
-Outputs to `outputs/plots/`:
+Artefacts:
 
-- `pressure_timeseries_{network}.png` and `flow_timeseries_{network}.png` for FOWM, Jilin and Hanoi normal baselines.
-- `leak_pressure_drop_net3.png` — pressure at the leak node and 3 nearby nodes, baseline vs leak.
-- `leak_demand_profile_net3.png` — abrupt leak demand profile (zero outside the window, constant during).
-- `leak_incipient_profile_hanoi.png` — linear-profile leak demand showing the staircase rise.
-- `leak_pressure_heatmap_jilin.png` — every node's pressure over time for the multi-leak scenario, with leak onsets marked.
-- `leak_multi_demand_jilin.png` — both concurrent leaks' demand profiles overlaid.
-- `leak_residual_net3.png` — heatmap of `baseline − leak` pressure to isolate the leak's effect from the diurnal pattern.
-- `leak_residual_timeseries_net3.png` — line-plot version of the residual at nearby nodes.
-- `leak_determinism_fowm.png` — pressure residual between two identical leak runs (~1e-12 m, Newton noise floor).
-- `validation_summary_phase3.txt` — full severity report and key metrics for every config.
+- `normal_pressure_comparison.png` — 2×2 grid: representative-node pressure traces under PDD for Net3, Hanoi, Jilin and FOWM.
+- `pdd_vs_dda_net3.png` — Net3 node "10" trace overlay under DDA and PDD (bit-identical; documents the topology artefact).
+- `leak_demand_profiles.png` — leak_demand traces for the abrupt (Net3), incipient (Hanoi) and multi-leak (Jilin) configs side by side.
+- `leak_residual_heatmap_net3.png` — pressure residual `normal_pdd − leak_abrupt` over all Net3 nodes (the leak's spatial footprint).
+- `sensor_faults_gallery.png` — 2×3 grid: clean vs corrupted at Net3 junction 15 for bias / drift / stuck / dropout / noise / gain.
+- `sensor_fault_residuals_gallery.png` — same grid, plotting `corrupted − clean`. The signature of each fault type is visible at a glance.
+- `cumulative_heatmap_net3.png` — corrupted-pressure heatmap for `cumulative_leak_bias_net3` with leak + sensor windows annotated.
+- `cumulative_residual_jilin.png` — pressure residual `normal_pdd − cumulative_leak_dropout` for Jilin (clean signal, so dropout NaNs do not poison the colour scale).
+- `cumulative_timeline_net3.png` — Gantt-style overlap of all fault windows for one cumulative scenario.
+- `leak_cleanup_columns.png` — column counts before/after leak-node cleanup .
+- `validation_summary_phase4.txt` — full severity table for every config, grouped by scenario type.
+
+The Phase 2 and Phase 3 scripts (`scripts/generate_phase2_plots.py`, `scripts/generate_phase3_plots.py`) and the Week 4 / Week 5 scripts remain in `scripts/` for reference.
+
+---
+
+## Reproducibility audit
+
+```bash
+python scripts/reproducibility_audit.py
+```
+
+Runs every config in `configs/` twice into separate output directories and compares the `pressure`, `flowrate`, `demand` and `leak_demand` Parquet tables. Writes a per-config PASS/FAIL summary to `outputs/reproducibility_audit.txt`. The PASS bar is 1e-12 m (the documented WNTRSimulator Newton-solver noise floor). Latest Phase 4 run: 24/24 PASS, worst residual 2.84e-14 m.
 
 ---
 
@@ -384,17 +590,48 @@ Outputs to `outputs/plots/`:
 ### Phase 4 Week 5: cumulative anomalies, gain fault, PDD normals, leak cleanup — complete
 
 - Cumulative scenarios (leak + sensor faults) run end-to-end with a dedicated `validate_cumulative_scenario`
-- Sixth sensor fault type `gain` with the D27 runtime detectability warning
-- Optional leak-node cleanup post-processing (`postprocess.py`, D28) reverting split artefacts on output
+- Sixth sensor fault type `gain` with the runtime detectability warning
+- Optional leak-node cleanup post-processing (`postprocess.py`) reverting split artefacts on output
 - Four PDD normal configs (the new project default for normal scenarios)
 - Five cumulative configs, `sensor_gain_net3` and `leak_abrupt_net3_clean`
 - Cumulative interaction recording (sensor fault on a leak node) in the sidecar metadata
 - 157 tests total, ruff clean, and `scripts/generate_week5_plots.py`
 
+### Phase 4 Week 6: batch driver, Phase 4 plots, reproducibility audit — complete
+
+- Sequential batch driver (`src/wdn_pipeline/batch.py`) with JSON + text summary artefacts; per-config failures isolated
+- CLI subcommand structure: `wdn-pipeline run <config>` and `wdn-pipeline batch <args>`. Custom `_DefaultCommandGroup` keeps the legacy `wdn-pipeline <config>` form working without a breaking change
+- n-aware noise std tolerance: `cumulative_leak_noise_fowm` no longer needs a hand-tuned `rng_offset`
+- Reproducibility audit script (`scripts/reproducibility_audit.py`): 24/24 configs deterministic to ~3e-14 m
+- Comprehensive Phase 4 plot script (`scripts/generate_phase4_plots.py`) producing 11 figures + `validation_summary_phase4.txt`
+- 169 tests total, ruff clean on `src/` and `tests/`
+
+### Phase 5 Week 7: DuckDB export, parallel batch, output organisation — complete
+
+- `DuckDBWriter` consolidated, materialised tables. New `output.duckdb` / `output.duckdb_path` config fields and a batch-wide `wdn-pipeline batch --duckdb PATH` flag
+- `ProcessPoolExecutor` parallel batch. New `--workers N` flag on `wdn-pipeline batch`; default 1 keeps sequential behaviour. Workers use the `spawn` start method; DuckDB writes are serialised in the main process
+- `scripts/organise_outputs.py` writes a Drive-ready CSV tree under `outputs/organised/{normal,leak,sensor_fault,cumulative}/<network>/<variant>/` with a top-level `README.md` documenting layout and source configs
+- 17 new tests (`test_duckdb.py` ×9, `test_batch.py` parallel cluster ×3, `test_organise_outputs.py` ×5). **186 tests total**, ruff clean on `src/` and `tests/`
+
+### Phase 5 Week 8: query layer, calibration, network sweep, parallelisation benchmark — complete
+
+- **Query layer:** `wdn_pipeline.query.DatasetQuery` + `wdn-pipeline query` CLI for partial retrieval (node/link/time/scenario/class slices). Materialised long tables (`pressure_long` etc.) indexed on `(scenario_basename, name, time_seconds)` for cross-scenario queries; `notebooks/02_query_demo.ipynb` walkthrough
+- **Calibration options:** WNTR hydraulic option allowlist plus validated `extra_hydraulic_options` passthrough; PDD-only and D-W/C-M guards; provenance logged to summary and sidecar; `configs/normal_net3_calibrated.yaml`
+- **Network sweep:** every LeakG3PD `.inp` run through the pipeline; `docs/network_sweep_report.md`. Added a non-convergence guard in `run_simulation` (empty results fail clearly instead of crashing the validators)
+- **Scale run + benchmark:** ~520-scenario generator (`scripts/generate_scale_configs.py`, one master seed), consolidated `outputs/scale_run.duckdb`; `scripts/benchmark_parallel.py` + `docs/parallelisation_benchmark.md` (best speedup at the physical core count; output parity verified to the 1e-12 floor)
+- **Bug fix:** mass balance now runs on the clean frames in the sensor-fault validator (a flowrate sensor fault no longer breaks it)
+- **230 tests total**, ruff clean on `src/`, `tests/` and `scripts/`
+
+### Closeout pass: water quality, ML loader, delivery polish — complete
+
+- **Water quality options:** chemical / age / trace analysis via the EpanetSimulator for non-leak scenarios (`simulation.quality`), exposed as a `quality` output table and through `DatasetQuery.quality()` / `wdn-pipeline query --quantity quality`. Leak + quality combinations are rejected. `configs/normal_net3_chemical.yaml`, `configs/normal_net3_age.yaml`
+- **ML loader:** `wdn_pipeline.ml` with a scenario-level train/test split and a windowed PyTorch `Dataset` (optional `ml` extra)
+- **Delivery polish:** mypy clean (`mypy src`), `ruff check` and `ruff format` clean across `src`/`tests`/`scripts`, MIT `LICENSE`, fresh-environment install verified from `pyproject.toml`. The fresh-env check fixed three install defects: a missing `numpy<2.4` pin, an undeclared `click` dependency and a CLI command-routing regression under newer click
+- **280 tests total**, mypy + ruff clean
+
 ### Upcoming
 
-- Phase 4 Week 6: batch generation, dataset polish, Phase 4 plots
-- Phase 5: dataset organisation and DuckDB queryable export
+- Phase 6 (Weeks 9-10): final report (LaTeX).
 - Phase 6: report writing
 
 ---
@@ -407,7 +644,8 @@ Outputs to `outputs/plots/`:
 | `pandas` + `pyarrow` | Tabular data and Parquet serialisation |
 | `pydantic` | Config schema validation |
 | `pyyaml` | YAML config loading |
-| `typer` | CLI |
+| `typer` + `click` | CLI (the custom command group subclasses click's `Group`) |
 | `matplotlib` | Visualisation |
-| `duckdb` | Queryable dataset exports (planned) |
-| `pytest` + `ruff` | Testing and linting |
+| `duckdb` | Queryable dataset exports |
+| `pytest` + `ruff` + `mypy` | Testing, linting and type checking |
+| `torch` | Optional (`ml` extra): the `WDNWindowDataset` PyTorch loader |

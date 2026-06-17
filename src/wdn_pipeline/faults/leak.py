@@ -3,7 +3,7 @@
 A leak is a hydraulic-model modification: the pipe is split, a new
 junction is inserted, and a leak orifice is added at that junction
 following WNTR's ``Q = Cd * A * sqrt(2 * g * h)`` model. Leaks must run
-under :class:`wntr.sim.WNTRSimulator` with PDD enabled (D16); the
+under :class:`wntr.sim.WNTRSimulator` with PDD enabled; the
 config validator rejects mismatched scenarios up front.
 
 Three profiles:
@@ -207,14 +207,10 @@ class LeakInjector:
         )
 
     @staticmethod
-    def _resolve_pipe(
-        wn: WaterNetworkModel, spec: LeakSpec, rng: np.random.Generator
-    ) -> str:
+    def _resolve_pipe(wn: WaterNetworkModel, spec: LeakSpec, rng: np.random.Generator) -> str:
         if spec.pipe is not None:
             if spec.pipe not in wn.link_name_list:
-                raise ValueError(
-                    f"LeakSpec.pipe={spec.pipe!r} is not a link in the network"
-                )
+                raise ValueError(f"LeakSpec.pipe={spec.pipe!r} is not a link in the network")
             link = wn.get_link(spec.pipe)
             if link.link_type != "Pipe":
                 raise ValueError(
@@ -222,11 +218,7 @@ class LeakInjector:
                 )
             return spec.pipe
 
-        candidates = [
-            name
-            for name in wn.link_name_list
-            if wn.get_link(name).link_type == "Pipe"
-        ]
+        candidates = [name for name in wn.link_name_list if wn.get_link(name).link_type == "Pipe"]
         if not candidates:
             raise ValueError("No pipes available for random leak placement")
         return str(rng.choice(candidates))
@@ -241,8 +233,11 @@ class LeakInjector:
     def _resolve_area(spec: LeakSpec) -> float:
         if spec.area_m2 is not None:
             return float(spec.area_m2)
-        # The config validator guarantees diameter_m is set if area_m2 is None.
-        diameter = float(spec.diameter_m)  # type: ignore[arg-type]
+        # The config validator guarantees diameter_m is set when area_m2
+        # is None; guard explicitly so the type narrows without an ignore.
+        if spec.diameter_m is None:
+            raise ValueError("LeakSpec must set exactly one of area_m2 or diameter_m")
+        diameter = float(spec.diameter_m)
         return math.pi * (diameter / 2.0) ** 2
 
     @staticmethod

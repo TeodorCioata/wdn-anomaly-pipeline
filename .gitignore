@@ -214,6 +214,11 @@ __marimo__/
 outputs/
 references/
 networks/*.inp
+networks/*.INP
+# Scale-run configs are reproducible from scripts/generate_scale_configs.py
+configs/scale/
+# Sweep configs are reproducible from scripts/generate_sweep_configs.py
+configs/sweep/
 *.parquet
 *.duckdb
 # EPANET/WNTR temporary simulation files

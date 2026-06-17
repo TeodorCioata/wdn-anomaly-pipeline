@@ -1,6 +1,6 @@
 # Cumulative scenario on Jilin: two concurrent leaks (one abrupt, one
-# incipient) plus a dropout sensor fault. Exercises D15 (multiple leaks
-# per scenario) together with a post-simulation sensor fault. The
+# incipient) plus a dropout sensor fault. Exercises multiple leaks
+# per scenario together with a post-simulation sensor fault. The
 # per-timestep label is the union of both leak windows and the dropout
 # outer window.
 

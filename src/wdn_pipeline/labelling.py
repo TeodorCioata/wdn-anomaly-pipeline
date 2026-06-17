@@ -1,6 +1,6 @@
 """Per-timestep labels and per-scenario metadata.
 
-Two complementary artefacts (decision D10):
+Two complementary artefacts:
 
 - A per-timestep ``label`` column attached to the wide pressure / flow
   DataFrames at output time. ``0`` means normal, ``1`` means anomalous.
@@ -10,7 +10,7 @@ Two complementary artefacts (decision D10):
   seed, scenario type, fault parameters, time window). The runner
   serialises this next to each output file.
 
-Per-channel masks (D22) are not stored in :class:`Labels` itself; the
+Per-channel masks are not stored in :class:`Labels` itself; the
 runner attaches them directly to the corresponding output table via
 :mod:`wdn_pipeline.output` to keep this module's responsibilities
 narrow.
@@ -36,9 +36,7 @@ class Labels:
     metadata: dict
 
 
-def _leak_label_series(
-    time_index: pd.Index, resolved_leaks: Sequence[ResolvedLeak]
-) -> pd.Series:
+def _leak_label_series(time_index: pd.Index, resolved_leaks: Sequence[ResolvedLeak]) -> pd.Series:
     labels = pd.Series(0, index=time_index, name="label", dtype="int8")
     if not resolved_leaks:
         return labels
@@ -79,7 +77,7 @@ def _detect_interactions(
     - a ``pressure`` fault on the inserted leak junction, or
     - a ``flowrate`` fault on either segment of the split pipe.
 
-    The result is **informational only** (decision D24 / Week 5 plan):
+    The result is **informational only** (Week 5 plan):
     it is surfaced in the sidecar metadata so a downstream consumer can
     see that the leak signature and the sensor fault overlap on the same
     channel, but it never gates the pipeline. The structural leak check
@@ -141,9 +139,7 @@ def build_labels(
     """
 
     leaks = list(resolved_leaks) if resolved_leaks else []
-    sensor_faults = (
-        list(resolved_sensor_faults) if resolved_sensor_faults else []
-    )
+    sensor_faults = list(resolved_sensor_faults) if resolved_sensor_faults else []
     labels = _leak_label_series(time_index, leaks)
     labels = _apply_sensor_fault_windows(labels, sensor_faults)
 

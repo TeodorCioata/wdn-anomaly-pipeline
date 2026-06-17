@@ -27,13 +27,13 @@ import pytest
 import yaml
 
 from wdn_pipeline.config import (
+    BiasFault,
     FaultsConfig,
     LeakSpec,
     NetworkConfig,
     OutputConfig,
     PipelineConfig,
     ScenarioConfig,
-    SensorFaultSpec,
     SimulationConfig,
     ValidationConfig,
 )
@@ -81,7 +81,7 @@ def _net3_cumulative(
                 )
             ],
             sensor_faults=[
-                SensorFaultSpec(
+                BiasFault(
                     type="bias",
                     quantity="pressure",
                     target=sensor_target,
@@ -102,9 +102,7 @@ def _net3_cumulative(
 
 
 @pytest.mark.parametrize("config_name", CUMULATIVE_CONFIGS)
-def test_cumulative_config_runs_end_to_end(
-    tmp_path: Path, config_name: str
-) -> None:
+def test_cumulative_config_runs_end_to_end(tmp_path: Path, config_name: str) -> None:
     yaml_path = REPO_ROOT / "configs" / f"{config_name}.yaml"
     raw = yaml.safe_load(yaml_path.read_text())
     raw["output"]["directory"] = str(tmp_path / "outputs")
@@ -118,9 +116,7 @@ def test_cumulative_config_runs_end_to_end(
 
 
 @pytest.mark.parametrize("config_name", CUMULATIVE_CONFIGS)
-def test_cumulative_validator_runs_both_check_families(
-    tmp_path: Path, config_name: str
-) -> None:
+def test_cumulative_validator_runs_both_check_families(tmp_path: Path, config_name: str) -> None:
     yaml_path = REPO_ROOT / "configs" / f"{config_name}.yaml"
     raw = yaml.safe_load(yaml_path.read_text())
     raw["output"]["directory"] = str(tmp_path / "outputs")
@@ -144,13 +140,9 @@ def test_cumulative_validator_runs_both_check_families(
 
 
 def test_cumulative_label_is_union_of_windows(tmp_path: Path) -> None:
-    cfg = _net3_cumulative(
-        tmp_path, leak_window=(21600, 64800), sensor_window=(3600, 14400)
-    )
+    cfg = _net3_cumulative(tmp_path, leak_window=(21600, 64800), sensor_window=(3600, 14400))
     summary = run(cfg)
-    pressure_path = next(
-        p for p in summary.output_paths if p.name.endswith("pressure.parquet")
-    )
+    pressure_path = next(p for p in summary.output_paths if p.name.endswith("pressure.parquet"))
     df = pq.read_table(pressure_path).to_pandas().set_index("time_seconds")
     times = df.index.to_numpy()
     leak_mask = (times >= 21600) & (times < 64800)
@@ -164,9 +156,7 @@ def test_cumulative_label_is_union_of_windows(tmp_path: Path) -> None:
 def test_cumulative_masks_are_separate_columns(tmp_path: Path) -> None:
     cfg = _net3_cumulative(tmp_path)
     summary = run(cfg)
-    pressure_path = next(
-        p for p in summary.output_paths if p.name.endswith("pressure.parquet")
-    )
+    pressure_path = next(p for p in summary.output_paths if p.name.endswith("pressure.parquet"))
     df = pq.read_table(pressure_path).to_pandas().set_index("time_seconds")
     # The per-channel sensor mask is its own column, distinct from the
     # union label.
@@ -232,9 +222,7 @@ def test_cumulative_random_leak_config_is_deterministic(
 ) -> None:
     """The FOWM config draws a random leak; the same seed reproduces it."""
 
-    raw = yaml.safe_load(
-        (REPO_ROOT / "configs" / "cumulative_leak_noise_fowm.yaml").read_text()
-    )
+    raw = yaml.safe_load((REPO_ROOT / "configs" / "cumulative_leak_noise_fowm.yaml").read_text())
     raw["output"]["formats"] = ["parquet"]
     raw1 = dict(raw)
     raw1["output"] = {**raw["output"], "directory": str(tmp_path / "a")}
@@ -243,6 +231,4 @@ def test_cumulative_random_leak_config_is_deterministic(
     s1 = run(PipelineConfig.model_validate(raw1))
     s2 = run(PipelineConfig.model_validate(raw2))
     assert s1.resolved_leaks[0].pipe == s2.resolved_leaks[0].pipe
-    assert s1.resolved_leaks[0].split_fraction == pytest.approx(
-        s2.resolved_leaks[0].split_fraction
-    )
+    assert s1.resolved_leaks[0].split_fraction == pytest.approx(s2.resolved_leaks[0].split_fraction)

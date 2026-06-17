@@ -111,9 +111,7 @@ def plot_determinism_residual(config_path: Path, out: Path) -> float:
     cfg = load_config(config_path)
     cfg2 = cfg.model_copy(
         update={
-            "output": cfg.output.model_copy(
-                update={"directory": REPO / "outputs" / "_determinism"}
-            )
+            "output": cfg.output.model_copy(update={"directory": REPO / "outputs" / "_determinism"})
         }
     )
     s1 = run(cfg)
@@ -134,9 +132,7 @@ def plot_determinism_residual(config_path: Path, out: Path) -> float:
     im = ax.imshow(arr.T, aspect="auto", cmap="magma", origin="lower")
     ax.set_xlabel("timestep index")
     ax.set_ylabel("node index")
-    ax.set_title(
-        f"Determinism check — |pressure_run1 - pressure_run2|, max = {max_abs:.2e} m"
-    )
+    ax.set_title(f"Determinism check — |pressure_run1 - pressure_run2|, max = {max_abs:.2e} m")
     fig.colorbar(im, ax=ax, label="abs residual (m)")
     fig.tight_layout()
     fig.savefig(out, dpi=120)
@@ -165,9 +161,7 @@ def main() -> None:
     plot_pressure_timeseries(results, PLOTS_DIR / "pressure_timeseries_net3.png")
     plot_flow_timeseries(results, PLOTS_DIR / "flow_timeseries_net3.png")
     plot_pressure_heatmap(results, PLOTS_DIR / "pressure_heatmap_net3.png")
-    max_abs = plot_determinism_residual(
-        net3_cfg_path, PLOTS_DIR / "determinism_residual_net3.png"
-    )
+    max_abs = plot_determinism_residual(net3_cfg_path, PLOTS_DIR / "determinism_residual_net3.png")
     write_validation_summary(PLOTS_DIR / "validation_summary.txt")
 
     print(f"Plots written to {PLOTS_DIR}")

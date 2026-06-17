@@ -24,13 +24,18 @@ import yaml
 from pydantic import ValidationError
 
 from wdn_pipeline.config import (
+    BiasFault,
+    DriftFault,
+    DropoutFault,
     FaultsConfig,
+    GainFault,
     NetworkConfig,
+    NoiseFault,
     OutputConfig,
     PipelineConfig,
     ScenarioConfig,
-    SensorFaultSpec,
     SimulationConfig,
+    StuckFault,
 )
 from wdn_pipeline.faults.sensor import (
     ResolvedSensorFault,
@@ -51,7 +56,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def test_bias_spec_requires_bias_value() -> None:
     with pytest.raises(ValidationError, match="bias_value"):
-        SensorFaultSpec(
+        BiasFault(
             type="bias",
             quantity="pressure",
             target="15",
@@ -62,7 +67,7 @@ def test_bias_spec_requires_bias_value() -> None:
 
 def test_bias_spec_rejects_zero_bias() -> None:
     with pytest.raises(ValidationError, match="non-zero"):
-        SensorFaultSpec(
+        BiasFault(
             type="bias",
             target="15",
             bias_value=0.0,
@@ -73,7 +78,7 @@ def test_bias_spec_rejects_zero_bias() -> None:
 
 def test_drift_spec_requires_slope() -> None:
     with pytest.raises(ValidationError, match="slope_per_second"):
-        SensorFaultSpec(
+        DriftFault(
             type="drift",
             target="15",
             start_time_seconds=0,
@@ -83,7 +88,7 @@ def test_drift_spec_requires_slope() -> None:
 
 def test_noise_spec_rejects_non_positive_sigma() -> None:
     with pytest.raises(ValidationError, match="sigma"):
-        SensorFaultSpec(
+        NoiseFault(
             type="noise",
             target="15",
             sigma=0.0,
@@ -94,7 +99,7 @@ def test_noise_spec_rejects_non_positive_sigma() -> None:
 
 def test_dropout_spec_rejects_interval_outside_window() -> None:
     with pytest.raises(ValidationError, match="outside the fault window"):
-        SensorFaultSpec(
+        DropoutFault(
             type="dropout",
             target="15",
             start_time_seconds=3600,
@@ -105,7 +110,7 @@ def test_dropout_spec_rejects_interval_outside_window() -> None:
 
 def test_dropout_spec_requires_nonempty_intervals() -> None:
     with pytest.raises(ValidationError, match="intervals"):
-        SensorFaultSpec(
+        DropoutFault(
             type="dropout",
             target="15",
             start_time_seconds=0,
@@ -116,7 +121,7 @@ def test_dropout_spec_requires_nonempty_intervals() -> None:
 
 def test_sensor_spec_rejects_end_before_start() -> None:
     with pytest.raises(ValidationError, match="end_time_seconds"):
-        SensorFaultSpec(
+        BiasFault(
             type="bias",
             target="15",
             bias_value=1.0,
@@ -136,7 +141,7 @@ def test_pipeline_rejects_sensor_fault_past_duration() -> None:
             ),
             faults=FaultsConfig(
                 sensor_faults=[
-                    SensorFaultSpec(
+                    BiasFault(
                         type="bias",
                         target="15",
                         bias_value=1.0,
@@ -190,7 +195,7 @@ def _build_fake_results(n_steps: int = 24, dt: int = 3600) -> SimulationResults:
 
 def test_bias_applies_constant_offset_in_window() -> None:
     results = _build_fake_results()
-    spec = SensorFaultSpec(
+    spec = BiasFault(
         type="bias",
         quantity="pressure",
         target="a",
@@ -198,9 +203,7 @@ def test_bias_applies_constant_offset_in_window() -> None:
         start_time_seconds=7200,
         end_time_seconds=21600,
     )
-    out = SensorFaultInjector().apply(
-        results, [spec], np.random.default_rng(0)
-    )
+    out = SensorFaultInjector().apply(results, [spec], np.random.default_rng(0))
     times = out.results.pressure.index.to_numpy()
     inside = (times >= 7200) & (times < 21600)
     outside = ~inside
@@ -211,25 +214,21 @@ def test_bias_applies_constant_offset_in_window() -> None:
 
 def test_bias_does_not_touch_other_columns() -> None:
     results = _build_fake_results()
-    spec = SensorFaultSpec(
+    spec = BiasFault(
         type="bias",
         target="a",
         bias_value=2.0,
         start_time_seconds=0,
         end_time_seconds=86400,
     )
-    out = SensorFaultInjector().apply(
-        results, [spec], np.random.default_rng(0)
-    )
-    pd.testing.assert_series_equal(
-        out.results.pressure["b"], results.pressure["b"]
-    )
+    out = SensorFaultInjector().apply(results, [spec], np.random.default_rng(0))
+    pd.testing.assert_series_equal(out.results.pressure["b"], results.pressure["b"])
     pd.testing.assert_frame_equal(out.results.flowrate, results.flowrate)
 
 
 def test_bias_preserves_clean_signal() -> None:
     results = _build_fake_results()
-    spec = SensorFaultSpec(
+    spec = BiasFault(
         type="bias",
         target="a",
         bias_value=5.0,
@@ -237,9 +236,7 @@ def test_bias_preserves_clean_signal() -> None:
         end_time_seconds=10800,
     )
     out = SensorFaultInjector().apply(results, [spec], np.random.default_rng(0))
-    pd.testing.assert_frame_equal(
-        out.results.pressure_clean, results.pressure_clean
-    )
+    pd.testing.assert_frame_equal(out.results.pressure_clean, results.pressure_clean)
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +246,7 @@ def test_bias_preserves_clean_signal() -> None:
 
 def test_drift_applies_linear_ramp_in_window() -> None:
     results = _build_fake_results()
-    spec = SensorFaultSpec(
+    spec = DriftFault(
         type="drift",
         target="a",
         slope_per_second=0.001,
@@ -269,7 +266,7 @@ def test_drift_applies_linear_ramp_in_window() -> None:
 
 def test_drift_zero_outside_window() -> None:
     results = _build_fake_results()
-    spec = SensorFaultSpec(
+    spec = DriftFault(
         type="drift",
         target="a",
         slope_per_second=0.005,
@@ -293,7 +290,7 @@ def test_drift_zero_outside_window() -> None:
 
 def test_stuck_freezes_at_start_value() -> None:
     results = _build_fake_results()
-    spec = SensorFaultSpec(
+    spec = StuckFault(
         type="stuck",
         target="a",
         start_time_seconds=10800,
@@ -310,7 +307,7 @@ def test_stuck_freezes_at_start_value() -> None:
 
 def test_stuck_leaves_outside_untouched() -> None:
     results = _build_fake_results()
-    spec = SensorFaultSpec(
+    spec = StuckFault(
         type="stuck",
         target="a",
         start_time_seconds=7200,
@@ -332,7 +329,7 @@ def test_stuck_leaves_outside_untouched() -> None:
 
 def test_dropout_fills_nan_in_subintervals() -> None:
     results = _build_fake_results()
-    spec = SensorFaultSpec(
+    spec = DropoutFault(
         type="dropout",
         target="a",
         start_time_seconds=0,
@@ -341,9 +338,7 @@ def test_dropout_fills_nan_in_subintervals() -> None:
     )
     out = SensorFaultInjector().apply(results, [spec], np.random.default_rng(0))
     times = out.results.pressure.index.to_numpy()
-    in_sub = ((times >= 3600) & (times < 10800)) | (
-        (times >= 21600) & (times < 25200)
-    )
+    in_sub = ((times >= 3600) & (times < 10800)) | ((times >= 21600) & (times < 25200))
     inside_vals = out.results.pressure["a"].to_numpy()[in_sub]
     outside_vals = out.results.pressure["a"].to_numpy()[~in_sub]
     assert np.all(np.isnan(inside_vals))
@@ -352,7 +347,7 @@ def test_dropout_fills_nan_in_subintervals() -> None:
 
 def test_dropout_respects_custom_fill_value() -> None:
     results = _build_fake_results()
-    spec = SensorFaultSpec(
+    spec = DropoutFault(
         type="dropout",
         target="a",
         fill_value=-1.0,
@@ -370,7 +365,7 @@ def test_dropout_mask_matches_subintervals_only() -> None:
     """The mask exposed by the injector covers sub-intervals, not the outer window."""
 
     results = _build_fake_results()
-    spec = SensorFaultSpec(
+    spec = DropoutFault(
         type="dropout",
         target="a",
         start_time_seconds=0,
@@ -390,7 +385,7 @@ def test_dropout_mask_matches_subintervals_only() -> None:
 
 def test_noise_corrupts_only_window() -> None:
     results = _build_fake_results(n_steps=100, dt=600)
-    spec = SensorFaultSpec(
+    spec = NoiseFault(
         type="noise",
         target="a",
         sigma=0.5,
@@ -402,10 +397,7 @@ def test_noise_corrupts_only_window() -> None:
     times = out.results.pressure.index.to_numpy()
     inside = (times >= 12000) & (times < 48000)
     outside = ~inside
-    diff = (
-        out.results.pressure["a"].to_numpy()
-        - results.pressure_clean["a"].to_numpy()
-    )
+    diff = out.results.pressure["a"].to_numpy() - results.pressure_clean["a"].to_numpy()
     assert not np.allclose(diff[inside], 0.0)
     assert np.allclose(diff[outside], 0.0)
 
@@ -414,7 +406,7 @@ def test_noise_residual_statistics_match_sigma() -> None:
     """Large-sample mean ~ 0, std ~ sigma."""
 
     results = _build_fake_results(n_steps=2000, dt=60)
-    spec = SensorFaultSpec(
+    spec = NoiseFault(
         type="noise",
         target="a",
         sigma=2.0,
@@ -423,10 +415,7 @@ def test_noise_residual_statistics_match_sigma() -> None:
         rng_offset=3,
     )
     out = SensorFaultInjector().apply(results, [spec], np.random.default_rng(11))
-    diff = (
-        out.results.pressure["a"].to_numpy()
-        - results.pressure_clean["a"].to_numpy()
-    )
+    diff = out.results.pressure["a"].to_numpy() - results.pressure_clean["a"].to_numpy()
     assert abs(float(diff.mean())) < 0.2
     assert abs(float(diff.std()) - 2.0) < 0.2
 
@@ -434,7 +423,7 @@ def test_noise_residual_statistics_match_sigma() -> None:
 def test_noise_deterministic_for_same_seed() -> None:
     results1 = _build_fake_results(n_steps=200, dt=300)
     results2 = _build_fake_results(n_steps=200, dt=300)
-    spec = SensorFaultSpec(
+    spec = NoiseFault(
         type="noise",
         target="a",
         sigma=1.0,
@@ -442,12 +431,8 @@ def test_noise_deterministic_for_same_seed() -> None:
         end_time_seconds=60000,
         rng_offset=5,
     )
-    out1 = SensorFaultInjector().apply(
-        results1, [spec], np.random.default_rng(42)
-    )
-    out2 = SensorFaultInjector().apply(
-        results2, [spec], np.random.default_rng(42)
-    )
+    out1 = SensorFaultInjector().apply(results1, [spec], np.random.default_rng(42))
+    out2 = SensorFaultInjector().apply(results2, [spec], np.random.default_rng(42))
     np.testing.assert_array_equal(
         out1.results.pressure["a"].to_numpy(),
         out2.results.pressure["a"].to_numpy(),
@@ -467,19 +452,15 @@ def test_random_target_selection_is_seeded(tmp_path: Path) -> None:
     )
     wn = load_network(NetworkConfig(inp_path="Net3"), sim_cfg)
     results = run_simulation(wn)
-    spec = SensorFaultSpec(
+    spec = BiasFault(
         type="bias",
         target=None,
         bias_value=1.5,
         start_time_seconds=0,
         end_time_seconds=86400,
     )
-    out1 = SensorFaultInjector().apply(
-        results, [spec], np.random.default_rng(99), wn=wn
-    )
-    out2 = SensorFaultInjector().apply(
-        results, [spec], np.random.default_rng(99), wn=wn
-    )
+    out1 = SensorFaultInjector().apply(results, [spec], np.random.default_rng(99), wn=wn)
+    out2 = SensorFaultInjector().apply(results, [spec], np.random.default_rng(99), wn=wn)
     assert out1.resolved[0].target == out2.resolved[0].target
 
 
@@ -491,22 +472,20 @@ def test_random_target_pressure_in_junctions(tmp_path: Path) -> None:
     )
     wn = load_network(NetworkConfig(inp_path="Net3"), sim_cfg)
     results = run_simulation(wn)
-    spec = SensorFaultSpec(
+    spec = BiasFault(
         type="bias",
         target=None,
         bias_value=1.5,
         start_time_seconds=0,
         end_time_seconds=86400,
     )
-    out = SensorFaultInjector().apply(
-        results, [spec], np.random.default_rng(7), wn=wn
-    )
+    out = SensorFaultInjector().apply(results, [spec], np.random.default_rng(7), wn=wn)
     assert out.resolved[0].target in wn.junction_name_list
 
 
 def test_invalid_target_raises_on_apply() -> None:
     results = _build_fake_results()
-    spec = SensorFaultSpec(
+    spec = BiasFault(
         type="bias",
         target="not_a_real_node",
         bias_value=1.0,
@@ -514,9 +493,7 @@ def test_invalid_target_raises_on_apply() -> None:
         end_time_seconds=86400,
     )
     with pytest.raises(ValueError, match="not a column"):
-        SensorFaultInjector().apply(
-            results, [spec], np.random.default_rng(0)
-        )
+        SensorFaultInjector().apply(results, [spec], np.random.default_rng(0))
 
 
 # ---------------------------------------------------------------------------
@@ -532,27 +509,21 @@ def test_mask_consistent_validator_passes_for_well_formed_run() -> None:
     )
     wn = load_network(NetworkConfig(inp_path="Net3"), sim_cfg)
     results = run_simulation(wn)
-    spec = SensorFaultSpec(
+    spec = BiasFault(
         type="bias",
         target="15",
         bias_value=1.0,
         start_time_seconds=21600,
         end_time_seconds=64800,
     )
-    out = SensorFaultInjector().apply(
-        results, [spec], np.random.default_rng(0), wn=wn
-    )
+    out = SensorFaultInjector().apply(results, [spec], np.random.default_rng(0), wn=wn)
     from wdn_pipeline.config import ValidationConfig
 
     report = validate_sensor_fault_scenario(
         wn, out.results, out.resolved, out.masks, ValidationConfig()
     )
-    mc = next(
-        c for c in report.checks if c.name == "sensor_fault_mask_consistent"
-    )
-    sa = next(
-        c for c in report.checks if c.name == "sensor_fault_signal_applied"
-    )
+    mc = next(c for c in report.checks if c.name == "sensor_fault_mask_consistent")
+    sa = next(c for c in report.checks if c.name == "sensor_fault_signal_applied")
     assert mc.severity == "ok"
     assert sa.severity == "ok"
 
@@ -586,9 +557,7 @@ def test_signal_applied_validator_detects_tampering() -> None:
     corrupted = results.pressure.copy()
     times = corrupted.index.to_numpy()
     active = (times >= 21600) & (times < 64800)
-    corrupted.loc[active, "15"] = (
-        results.pressure_clean["15"].to_numpy()[active] + 9.9
-    )
+    corrupted.loc[active, "15"] = results.pressure_clean["15"].to_numpy()[active] + 9.9
     tampered_results = SimulationResults(
         pressure=corrupted,
         flowrate=results.flowrate,
@@ -608,9 +577,7 @@ def test_signal_applied_validator_detects_tampering() -> None:
         {"bias_mask_15": mask},
         ValidationConfig(),
     )
-    sa = next(
-        c for c in report.checks if c.name == "sensor_fault_signal_applied"
-    )
+    sa = next(c for c in report.checks if c.name == "sensor_fault_signal_applied")
     assert sa.severity == "fail"
 
 
@@ -637,16 +604,8 @@ def test_sensor_config_end_to_end(tmp_path: Path, config_name: str) -> None:
     raw["output"]["directory"] = str(tmp_path / "outputs")
     cfg = PipelineConfig.model_validate(raw)
     summary = run(cfg)
-    mc = next(
-        c
-        for c in summary.validation.checks
-        if c.name == "sensor_fault_mask_consistent"
-    )
-    sa = next(
-        c
-        for c in summary.validation.checks
-        if c.name == "sensor_fault_signal_applied"
-    )
+    mc = next(c for c in summary.validation.checks if c.name == "sensor_fault_mask_consistent")
+    sa = next(c for c in summary.validation.checks if c.name == "sensor_fault_signal_applied")
     assert mc.severity == "ok"
     assert sa.severity == "ok"
 
@@ -665,7 +624,7 @@ def test_end_to_end_label_window_matches_fault(tmp_path: Path) -> None:
         scenario=ScenarioConfig(type="sensor_fault", label="sensor_bias_test"),
         faults=FaultsConfig(
             sensor_faults=[
-                SensorFaultSpec(
+                BiasFault(
                     type="bias",
                     target="15",
                     bias_value=2.0,
@@ -677,9 +636,7 @@ def test_end_to_end_label_window_matches_fault(tmp_path: Path) -> None:
         output=OutputConfig(directory=tmp_path / "out", formats=["parquet"]),
     )
     summary = run(cfg)
-    pressure_path = next(
-        p for p in summary.output_paths if "pressure.parquet" in p.name
-    )
+    pressure_path = next(p for p in summary.output_paths if "pressure.parquet" in p.name)
     df = pq.read_table(pressure_path).to_pandas().set_index("time_seconds")
     labels = df["label"].astype(int)
     expected = ((labels.index >= 21600) & (labels.index < 64800)).astype(int)
@@ -699,12 +656,10 @@ def test_clean_table_preserved_and_differs_from_corrupted(tmp_path: Path) -> Non
             report_timestep_seconds=3600,
         ),
         seed=42,
-        scenario=ScenarioConfig(
-            type="sensor_fault", label="sensor_bias_clean_test"
-        ),
+        scenario=ScenarioConfig(type="sensor_fault", label="sensor_bias_clean_test"),
         faults=FaultsConfig(
             sensor_faults=[
-                SensorFaultSpec(
+                BiasFault(
                     type="bias",
                     target="15",
                     bias_value=3.0,
@@ -716,15 +671,9 @@ def test_clean_table_preserved_and_differs_from_corrupted(tmp_path: Path) -> Non
         output=OutputConfig(directory=tmp_path / "out", formats=["parquet"]),
     )
     summary = run(cfg)
-    pressure_path = next(
-        p
-        for p in summary.output_paths
-        if p.name.endswith("pressure.parquet")
-    )
+    pressure_path = next(p for p in summary.output_paths if p.name.endswith("pressure.parquet"))
     pressure_clean_path = next(
-        p
-        for p in summary.output_paths
-        if p.name.endswith("pressure_clean.parquet")
+        p for p in summary.output_paths if p.name.endswith("pressure_clean.parquet")
     )
     p = pq.read_table(pressure_path).to_pandas().set_index("time_seconds")
     pc = pq.read_table(pressure_clean_path).to_pandas().set_index("time_seconds")
@@ -746,12 +695,10 @@ def test_end_to_end_is_deterministic(tmp_path: Path) -> None:
             report_timestep_seconds=3600,
         ),
         seed=42,
-        scenario=ScenarioConfig(
-            type="sensor_fault", label="sensor_noise_det"
-        ),
+        scenario=ScenarioConfig(type="sensor_fault", label="sensor_noise_det"),
         faults=FaultsConfig(
             sensor_faults=[
-                SensorFaultSpec(
+                NoiseFault(
                     type="noise",
                     target="15",
                     sigma=0.5,
@@ -768,12 +715,8 @@ def test_end_to_end_is_deterministic(tmp_path: Path) -> None:
     )
     s1 = run(base)
     s2 = run(other)
-    path1 = next(
-        p for p in s1.output_paths if p.name.endswith("pressure.parquet")
-    )
-    path2 = next(
-        p for p in s2.output_paths if p.name.endswith("pressure.parquet")
-    )
+    path1 = next(p for p in s1.output_paths if p.name.endswith("pressure.parquet"))
+    path2 = next(p for p in s2.output_paths if p.name.endswith("pressure.parquet"))
     df1 = pq.read_table(path1).to_pandas().set_index("time_seconds")
     df2 = pq.read_table(path2).to_pandas().set_index("time_seconds")
     pd.testing.assert_frame_equal(df1, df2)
@@ -788,12 +731,10 @@ def test_metadata_records_resolved_sensor_fault(tmp_path: Path) -> None:
             report_timestep_seconds=3600,
         ),
         seed=42,
-        scenario=ScenarioConfig(
-            type="sensor_fault", label="sensor_drift_meta"
-        ),
+        scenario=ScenarioConfig(type="sensor_fault", label="sensor_drift_meta"),
         faults=FaultsConfig(
             sensor_faults=[
-                SensorFaultSpec(
+                DriftFault(
                     type="drift",
                     target="15",
                     slope_per_second=0.001,
@@ -825,12 +766,10 @@ def test_mask_column_emitted_in_pressure_table(tmp_path: Path) -> None:
             report_timestep_seconds=3600,
         ),
         seed=42,
-        scenario=ScenarioConfig(
-            type="sensor_fault", label="sensor_bias_mask"
-        ),
+        scenario=ScenarioConfig(type="sensor_fault", label="sensor_bias_mask"),
         faults=FaultsConfig(
             sensor_faults=[
-                SensorFaultSpec(
+                BiasFault(
                     type="bias",
                     target="15",
                     bias_value=4.0,
@@ -842,15 +781,11 @@ def test_mask_column_emitted_in_pressure_table(tmp_path: Path) -> None:
         output=OutputConfig(directory=tmp_path / "out", formats=["parquet"]),
     )
     summary = run(cfg)
-    pressure_path = next(
-        p for p in summary.output_paths if p.name.endswith("pressure.parquet")
-    )
+    pressure_path = next(p for p in summary.output_paths if p.name.endswith("pressure.parquet"))
     df = pq.read_table(pressure_path).to_pandas().set_index("time_seconds")
     assert "bias_mask_15" in df.columns
     mask = df["bias_mask_15"].astype(bool).to_numpy()
-    expected = (df.index.to_numpy() >= 21600) & (
-        df.index.to_numpy() < 64800
-    )
+    expected = (df.index.to_numpy() >= 21600) & (df.index.to_numpy() < 64800)
     assert np.array_equal(mask, expected)
 
 
@@ -868,13 +803,13 @@ def test_run_from_yaml_config(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Gain fault (Week 5, D27)
+# Gain fault (Week 5)
 # ---------------------------------------------------------------------------
 
 
 def test_gain_spec_requires_gain_factor() -> None:
     with pytest.raises(ValidationError, match="gain_factor"):
-        SensorFaultSpec(
+        GainFault(
             type="gain",
             target="15",
             start_time_seconds=0,
@@ -884,7 +819,7 @@ def test_gain_spec_requires_gain_factor() -> None:
 
 def test_gain_spec_rejects_unit_gain() -> None:
     with pytest.raises(ValidationError, match="no-op"):
-        SensorFaultSpec(
+        GainFault(
             type="gain",
             target="15",
             gain_factor=1.0,
@@ -895,7 +830,7 @@ def test_gain_spec_rejects_unit_gain() -> None:
 
 def test_gain_spec_rejects_zero_gain() -> None:
     with pytest.raises(ValidationError, match="zero gain"):
-        SensorFaultSpec(
+        GainFault(
             type="gain",
             target="15",
             gain_factor=0.0,
@@ -906,7 +841,7 @@ def test_gain_spec_rejects_zero_gain() -> None:
 
 def test_gain_applies_multiplicative_factor_in_window() -> None:
     results = _build_fake_results()
-    spec = SensorFaultSpec(
+    spec = GainFault(
         type="gain",
         target="a",
         gain_factor=1.2,
@@ -924,7 +859,7 @@ def test_gain_applies_multiplicative_factor_in_window() -> None:
 
 def test_gain_deterministic_for_same_seed() -> None:
     results = _build_fake_results()
-    spec = SensorFaultSpec(
+    spec = GainFault(
         type="gain",
         target="a",
         gain_factor=0.85,
@@ -938,7 +873,7 @@ def test_gain_deterministic_for_same_seed() -> None:
 
 def test_gain_resolved_records_factor() -> None:
     results = _build_fake_results()
-    spec = SensorFaultSpec(
+    spec = GainFault(
         type="gain",
         target="a",
         gain_factor=1.15,
@@ -957,23 +892,15 @@ def test_gain_config_end_to_end(tmp_path: Path) -> None:
     raw["output"]["directory"] = str(tmp_path / "outputs")
     cfg = PipelineConfig.model_validate(raw)
     summary = run(cfg)
-    mc = next(
-        c
-        for c in summary.validation.checks
-        if c.name == "sensor_fault_mask_consistent"
-    )
-    sa = next(
-        c
-        for c in summary.validation.checks
-        if c.name == "sensor_fault_signal_applied"
-    )
+    mc = next(c for c in summary.validation.checks if c.name == "sensor_fault_mask_consistent")
+    sa = next(c for c in summary.validation.checks if c.name == "sensor_fault_signal_applied")
     assert mc.severity == "ok"
     # A 10% gain is well above the 5% detectability floor.
     assert sa.severity == "ok"
 
 
 def test_gain_detectability_warning_for_small_gain() -> None:
-    """A gain factor very close to 1.0 triggers the D27 detectability warning."""
+    """A gain factor very close to 1.0 triggers the detectability warning."""
 
     from wdn_pipeline.config import ValidationConfig
 
@@ -984,22 +911,18 @@ def test_gain_detectability_warning_for_small_gain() -> None:
     )
     wn = load_network(NetworkConfig(inp_path="Net3"), sim_cfg)
     results = run_simulation(wn)
-    spec = SensorFaultSpec(
+    spec = GainFault(
         type="gain",
         target="15",
         gain_factor=1.001,
         start_time_seconds=0,
         end_time_seconds=86400,
     )
-    out = SensorFaultInjector().apply(
-        results, [spec], np.random.default_rng(0), wn=wn
-    )
+    out = SensorFaultInjector().apply(results, [spec], np.random.default_rng(0), wn=wn)
     report = validate_sensor_fault_scenario(
         wn, out.results, out.resolved, out.masks, ValidationConfig()
     )
-    sa = next(
-        c for c in report.checks if c.name == "sensor_fault_signal_applied"
-    )
+    sa = next(c for c in report.checks if c.name == "sensor_fault_signal_applied")
     # Structural part still holds (corrupted == gain * clean), so this is
     # a warning, not a fail.
     assert sa.severity == "warning"
@@ -1018,20 +941,73 @@ def test_gain_detectability_ok_for_large_gain() -> None:
     )
     wn = load_network(NetworkConfig(inp_path="Net3"), sim_cfg)
     results = run_simulation(wn)
-    spec = SensorFaultSpec(
+    spec = GainFault(
         type="gain",
         target="15",
         gain_factor=1.25,
         start_time_seconds=0,
         end_time_seconds=86400,
     )
-    out = SensorFaultInjector().apply(
-        results, [spec], np.random.default_rng(0), wn=wn
-    )
+    out = SensorFaultInjector().apply(results, [spec], np.random.default_rng(0), wn=wn)
     report = validate_sensor_fault_scenario(
         wn, out.results, out.resolved, out.masks, ValidationConfig()
     )
-    sa = next(
-        c for c in report.checks if c.name == "sensor_fault_signal_applied"
-    )
+    sa = next(c for c in report.checks if c.name == "sensor_fault_signal_applied")
     assert sa.severity == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Multiple faults on the same channel (hardening pass R1)
+# ---------------------------------------------------------------------------
+
+
+def test_two_faults_on_same_channel_compose() -> None:
+    """Two different-type faults on one channel both appear in the output.
+
+    Regression: previously each fault rewrote the whole column from the
+    clean baseline, so only the last-applied fault survived. The injector
+    now writes only each fault's active region, preserving earlier faults.
+    """
+
+    results = _build_fake_results(n_steps=24, dt=3600)
+    bias = BiasFault(
+        type="bias",
+        target="a",
+        bias_value=3.0,
+        start_time_seconds=0,
+        end_time_seconds=7200,  # first two steps
+    )
+    stuck = StuckFault(
+        type="stuck",
+        target="a",
+        start_time_seconds=36000,  # later, disjoint window
+        end_time_seconds=72000,
+    )
+    out = SensorFaultInjector().apply(results, [bias, stuck], np.random.default_rng(0))
+    times = out.results.pressure.index.to_numpy()
+    clean = results.pressure_clean["a"].to_numpy()
+    corrupted = out.results.pressure["a"].to_numpy()
+    bias_win = (times >= 0) & (times < 7200)
+    stuck_win = (times >= 36000) & (times < 72000)
+    untouched = ~bias_win & ~stuck_win
+    # Bias effect survives even though it was applied first.
+    assert np.allclose(corrupted[bias_win], clean[bias_win] + 3.0)
+    # Stuck effect present (frozen at its first in-window clean value).
+    stuck_value = clean[np.where(stuck_win)[0][0]]
+    assert np.allclose(corrupted[stuck_win], stuck_value)
+    # Everything outside both windows is the untouched clean signal.
+    assert np.allclose(corrupted[untouched], clean[untouched])
+
+
+def test_duplicate_same_type_target_raises() -> None:
+    """Two faults of the same type on the same channel are rejected."""
+
+    results = _build_fake_results()
+    f1 = BiasFault(
+        type="bias", target="a", bias_value=1.0, start_time_seconds=0, end_time_seconds=7200
+    )
+    f2 = BiasFault(
+        type="bias", target="a", bias_value=2.0, start_time_seconds=7200, end_time_seconds=14400
+    )
+    with pytest.raises(ValueError, match="Duplicate sensor-fault mask"):
+        SensorFaultInjector().apply(results, [f1, f2], np.random.default_rng(0))

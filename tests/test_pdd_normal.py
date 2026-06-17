@@ -35,9 +35,7 @@ PDD_NORMAL_CONFIGS = [
 
 
 def _run_config(tmp_path: Path, config_name: str):
-    raw = yaml.safe_load(
-        (REPO_ROOT / "configs" / f"{config_name}.yaml").read_text()
-    )
+    raw = yaml.safe_load((REPO_ROOT / "configs" / f"{config_name}.yaml").read_text())
     raw["output"]["directory"] = str(tmp_path / "outputs")
     raw["output"]["formats"] = ["parquet"]
     return run(PipelineConfig.model_validate(raw))
@@ -71,12 +69,8 @@ def test_pdd_normal_pressure_non_negative_on_clean_networks(
             pattern_timestep_seconds=3600,
             demand_model="PDD",
         )
-        raw = yaml.safe_load(
-            (REPO_ROOT / "configs" / f"{name}.yaml").read_text()
-        )
-        wn = load_network(
-            NetworkConfig(inp_path=raw["network"]["inp_path"]), sim_cfg
-        )
+        raw = yaml.safe_load((REPO_ROOT / "configs" / f"{name}.yaml").read_text())
+        wn = load_network(NetworkConfig(inp_path=raw["network"]["inp_path"]), sim_cfg)
         results = run_simulation(wn)
         assert float(np.nanmin(results.pressure.to_numpy())) >= -1e-6, name
 
@@ -116,8 +110,6 @@ def test_pdd_normal_net3_warning_stays_within_tolerance(
     """Net3 PDD normal warns on pressure_bounds but never fails."""
 
     summary = _run_config(tmp_path, "normal_net3_pdd")
-    bounds = next(
-        c for c in summary.validation.checks if c.name == "pressure_bounds"
-    )
+    bounds = next(c for c in summary.validation.checks if c.name == "pressure_bounds")
     assert bounds.severity in ("ok", "warning")
     assert summary.validation.passed

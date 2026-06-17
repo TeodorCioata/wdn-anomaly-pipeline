@@ -1,4 +1,4 @@
-# Single abrupt leak on Net3 with leak-node cleanup enabled (D28).
+# Single abrupt leak on Net3 with leak-node cleanup enabled.
 # Identical to leak_abrupt_net3.yaml except output.remove_leak_nodes is
 # true: the post-processing step reverts the leak-node split artefacts
 # so the output tables carry the original Net3 column schema. The

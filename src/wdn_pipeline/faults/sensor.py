@@ -1,4 +1,4 @@
-"""Sensor fault injection (post-simulation, D5).
+"""Sensor fault injection (post-simulation).
 
 A sensor fault corrupts the reported signal at a single channel without
 touching the hydraulic model. The injector takes a
@@ -8,7 +8,7 @@ returns a *new* :class:`SimulationResults` whose ``pressure`` and / or
 original simulator output is preserved verbatim in the ``pressure_clean``
 and ``flowrate_clean`` companion frames.
 
-Six strategies are implemented (D18):
+Six strategies are implemented:
 
 - ``bias``: constant offset ``y'(t) = y(t) + bias_value``
 - ``drift``: linear ramp ``y'(t) = y(t) + slope * (t - start)``
@@ -105,7 +105,7 @@ class SensorFaultApplyResult:
             with the input specs.
         masks: Mapping ``column_name -> boolean Series`` indicating
             where each fault was active. ``column_name`` follows the
-            ``{fault_type}_mask_{target}`` convention (D26).
+            ``{fault_type}_mask_{target}`` convention.
     """
 
     results: SimulationResults
@@ -171,23 +171,44 @@ class SensorFaultInjector:
                 corrupted_col, mask = self._apply_one(
                     spec, clean_col, results.pressure.index, rng, idx
                 )
-                corrupted_pressure[target] = corrupted_col
-                mask_series = pd.Series(
-                    mask, index=results.pressure.index, dtype=bool
-                )
+                # Write only the masked (corrupted) region so an earlier
+                # fault on the same channel is preserved outside this
+                # fault's window. For a single fault this is identical to
+                # replacing the whole column (corrupted_col equals clean
+                # outside the mask).
+                col = corrupted_pressure[target].to_numpy().copy()
+                col[mask] = corrupted_col[mask]
+                corrupted_pressure[target] = col
+                mask_series = pd.Series(mask, index=results.pressure.index, dtype=bool)
             else:  # flowrate
                 clean_col = clean_flowrate[target].to_numpy()
                 corrupted_col, mask = self._apply_one(
                     spec, clean_col, results.flowrate.index, rng, idx
                 )
-                corrupted_flowrate[target] = corrupted_col
-                mask_series = pd.Series(
-                    mask, index=results.flowrate.index, dtype=bool
-                )
+                col = corrupted_flowrate[target].to_numpy().copy()
+                col[mask] = corrupted_col[mask]
+                corrupted_flowrate[target] = col
+                mask_series = pd.Series(mask, index=results.flowrate.index, dtype=bool)
 
             mask_col = f"{spec.type}_mask_{target}"
+            if mask_col in masks:
+                # Two faults of the same type on the same channel would
+                # collapse into one mask column and one ground-truth record,
+                # silently merging them. Reject it so per-channel provenance
+                # stays unambiguous; distinct types or targets are fine.
+                raise ValueError(
+                    f"Duplicate sensor-fault mask column {mask_col!r}: two faults of "
+                    f"type {spec.type!r} target channel {target!r}. Use distinct fault "
+                    "types or targets."
+                )
             masks[mask_col] = mask_series
 
+            # The per-type fields live on the matching union member only,
+            # so they are read with getattr; the discriminated-union
+            # validator guarantees the field is present for the matching
+            # ``type``. ``ResolvedSensorFault`` remains a single record
+            # carrying all of them as Optionals.
+            spec_intervals = getattr(spec, "intervals", None)
             resolved_list.append(
                 ResolvedSensorFault(
                     type=spec.type,
@@ -195,17 +216,17 @@ class SensorFaultInjector:
                     target=target,
                     start_time_seconds=int(spec.start_time_seconds),
                     end_time_seconds=int(spec.end_time_seconds),
-                    bias_value=spec.bias_value,
-                    slope_per_second=spec.slope_per_second,
+                    bias_value=getattr(spec, "bias_value", None),
+                    slope_per_second=getattr(spec, "slope_per_second", None),
                     intervals=(
-                        [tuple(map(int, iv)) for iv in spec.intervals]
-                        if spec.intervals is not None
+                        [(int(iv[0]), int(iv[1])) for iv in spec_intervals]
+                        if spec_intervals is not None
                         else None
                     ),
-                    fill_value=spec.fill_value,
-                    sigma=spec.sigma,
-                    rng_offset=int(spec.rng_offset),
-                    gain_factor=spec.gain_factor,
+                    fill_value=getattr(spec, "fill_value", None),
+                    sigma=getattr(spec, "sigma", None),
+                    rng_offset=int(getattr(spec, "rng_offset", 0)),
+                    gain_factor=getattr(spec, "gain_factor", None),
                     name=spec.name,
                 )
             )
@@ -228,9 +249,7 @@ class SensorFaultInjector:
             pressure_clean=clean_pressure,
             flowrate_clean=clean_flowrate,
         )
-        return SensorFaultApplyResult(
-            results=new_results, resolved=resolved_list, masks=masks
-        )
+        return SensorFaultApplyResult(results=new_results, resolved=resolved_list, masks=masks)
 
     @staticmethod
     def _resolve_target(
@@ -250,21 +269,15 @@ class SensorFaultInjector:
             kind = "junction"
         else:
             candidates = [
-                name
-                for name in wn.link_name_list
-                if wn.get_link(name).link_type == "Pipe"
+                name for name in wn.link_name_list if wn.get_link(name).link_type == "Pipe"
             ]
             kind = "pipe"
         if not candidates:
-            raise ValueError(
-                f"No {kind}s available for random sensor target selection"
-            )
+            raise ValueError(f"No {kind}s available for random sensor target selection")
         return str(rng.choice(candidates))
 
     @staticmethod
-    def _validate_target(
-        target: str, spec: SensorFaultSpec, results: SimulationResults
-    ) -> None:
+    def _validate_target(target: str, spec: SensorFaultSpec, results: SimulationResults) -> None:
         if spec.quantity == "pressure":
             if target not in results.pressure.columns:
                 raise ValueError(
@@ -279,9 +292,7 @@ class SensorFaultInjector:
                 )
 
     @staticmethod
-    def _window_mask(
-        time_index: pd.Index, start: int, end: int
-    ) -> np.ndarray:
+    def _window_mask(time_index: pd.Index, start: int, end: int) -> np.ndarray:
         """Boolean array, True for indices in the half-open [start, end)."""
 
         times = time_index.to_numpy()
@@ -310,9 +321,9 @@ class SensorFaultInjector:
         corrupted = clean.astype(float).copy()
 
         if spec.type == "bias":
-            corrupted[active] = clean[active] + float(spec.bias_value)  # type: ignore[arg-type]
+            corrupted[active] = clean[active] + float(spec.bias_value)
         elif spec.type == "drift":
-            slope = float(spec.slope_per_second)  # type: ignore[arg-type]
+            slope = float(spec.slope_per_second)
             dt = times[active] - start
             corrupted[active] = clean[active] + slope * dt
         elif spec.type == "stuck":
@@ -323,9 +334,7 @@ class SensorFaultInjector:
             stuck_value = float(clean[active_idx[0]])
             corrupted[active] = stuck_value
         elif spec.type == "dropout":
-            fill = (
-                float("nan") if spec.fill_value is None else float(spec.fill_value)
-            )
+            fill = float("nan") if spec.fill_value is None else float(spec.fill_value)
             # Dropout mask is the union of the configured sub-intervals,
             # not the outer window. The outer window is recorded as the
             # fault's authoritative window for labelling, but corruption
@@ -338,7 +347,7 @@ class SensorFaultInjector:
             # the outer window covers all sub-intervals by construction.
             return corrupted, sub_active
         elif spec.type == "noise":
-            sigma = float(spec.sigma)  # type: ignore[arg-type]
+            sigma = float(spec.sigma)
             # Each noise fault forks its own sub-RNG. We mix the parent
             # RNG with rng_offset and the fault index so two noise faults
             # in the same scenario don't share samples.
@@ -347,7 +356,7 @@ class SensorFaultInjector:
             samples = sub_rng.normal(0.0, sigma, size=int(active.sum()))
             corrupted[active] = clean[active] + samples
         elif spec.type == "gain":
-            gain = float(spec.gain_factor)  # type: ignore[arg-type]
+            gain = float(spec.gain_factor)
             corrupted[active] = clean[active] * gain
         else:
             raise ValueError(f"Unknown sensor fault type: {spec.type}")

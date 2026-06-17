@@ -89,7 +89,7 @@ def test_leakspec_rejects_invalid_discharge_coeff() -> None:
 
 
 def test_pipeline_rejects_dda_with_leaks() -> None:
-    """D16: leaks require PDD; the validator must reject DDA + leaks."""
+    """Leaks require PDD; the validator must reject DDA + leaks."""
 
     with pytest.raises(ValidationError, match="PDD"):
         PipelineConfig(
@@ -115,13 +115,7 @@ def test_pipeline_rejects_leak_window_past_duration() -> None:
                 demand_model="PDD",
             ),
             faults=FaultsConfig(
-                leaks=[
-                    LeakSpec(
-                        **_abrupt_leak_kwargs(
-                            start_time_seconds=0, end_time_seconds=7200
-                        )
-                    )
-                ]
+                leaks=[LeakSpec(**_abrupt_leak_kwargs(start_time_seconds=0, end_time_seconds=7200))]
             ),
         )
 
@@ -181,6 +175,24 @@ def test_diameter_to_area_conversion(net3_pdd) -> None:
     expected_area = np.pi * (0.1 / 2.0) ** 2
     assert resolved.area_m2 == pytest.approx(expected_area)
     assert resolved.diameter_m == 0.1
+
+
+def test_two_leaks_on_same_pipe(net3_pdd) -> None:
+    """Two leaks on one pipe re-split the upstream segment with unique names."""
+
+    spec1 = LeakSpec(**_abrupt_leak_kwargs(pipe="40", split_fraction=0.3))
+    spec2 = LeakSpec(**_abrupt_leak_kwargs(pipe="40", split_fraction=0.6))
+    rng = np.random.default_rng(0)
+    resolved = LeakInjector().apply(net3_pdd, [spec1, spec2], rng)
+    assert len(resolved) == 2
+    # Distinct leak-node and split-segment names (the unique-name helper).
+    assert resolved[0].leak_node_name != resolved[1].leak_node_name
+    assert resolved[0].new_pipe_name != resolved[1].new_pipe_name
+    assert resolved[0].leak_node_name in net3_pdd.junction_name_list
+    assert resolved[1].leak_node_name in net3_pdd.junction_name_list
+    # Both leak nodes carry an active orifice.
+    assert net3_pdd.get_node(resolved[0].leak_node_name)._leak is True
+    assert net3_pdd.get_node(resolved[1].leak_node_name)._leak is True
 
 
 def test_random_pipe_selection_is_seeded() -> None:
@@ -337,8 +349,7 @@ def test_incipient_linear_monotonic_growth(tmp_path: Path) -> None:
     df = pq.read_table(leak_path).to_pandas().set_index("time_seconds")
     series = df[resolved.leak_node_name]
     during = series.loc[
-        (series.index >= leak.start_time_seconds)
-        & (series.index < leak.end_time_seconds)
+        (series.index >= leak.start_time_seconds) & (series.index < leak.end_time_seconds)
     ]
     # Leak demand depends on both area and head; as the leak grows the
     # system head drops so the demand-vs-time curve is not strictly
@@ -450,9 +461,9 @@ def test_leak_pressure_drop_check_fires_warning(net3_pdd) -> None:
     results = run_simulation(net3_pdd)
     from wdn_pipeline.config import ValidationConfig
 
-    report = validate_leak_scenario(net3_pdd, results, resolved, ValidationConfig(
-        pressure_min_warning_tolerance_m=2.0
-    ))
+    report = validate_leak_scenario(
+        net3_pdd, results, resolved, ValidationConfig(pressure_min_warning_tolerance_m=2.0)
+    )
     pd_check = next(c for c in report.checks if c.name == "leak_pressure_drop")
     # Net3 + pipe "40" has the documented diurnal-confound issue; warning
     # is the correct severity.
@@ -476,9 +487,7 @@ def test_deterministic_random_leak_resolution(tmp_path: Path) -> None:
         profile="abrupt",
     )
     cfg = PipelineConfig(
-        network=NetworkConfig(
-            inp_path=str(REPO_ROOT / "networks" / "FOWM.inp"), name="fowm"
-        ),
+        network=NetworkConfig(inp_path=str(REPO_ROOT / "networks" / "FOWM.inp"), name="fowm"),
         simulation=SimulationConfig(
             duration_seconds=24 * 3600,
             hydraulic_timestep_seconds=3600,
@@ -502,9 +511,7 @@ def test_deterministic_random_leak_resolution(tmp_path: Path) -> None:
         output=OutputConfig(directory=tmp_path / "first", formats=["parquet"]),
     )
     cfg2 = cfg.model_copy(
-        update={
-            "output": cfg.output.model_copy(update={"directory": tmp_path / "second"})
-        }
+        update={"output": cfg.output.model_copy(update={"directory": tmp_path / "second"})}
     )
     s1 = run(cfg)
     s2 = run(cfg2)
@@ -546,8 +553,7 @@ def test_leak_label_window_matches_resolved(tmp_path: Path) -> None:
     # leak_demand is already zero there. Including end_time_seconds in
     # the label window would mark a normal frame as anomalous.
     expected = (
-        (labels.index >= leak.start_time_seconds)
-        & (labels.index < leak.end_time_seconds)
+        (labels.index >= leak.start_time_seconds) & (labels.index < leak.end_time_seconds)
     ).astype(int)
     pd.testing.assert_series_equal(
         labels.rename("x"),
