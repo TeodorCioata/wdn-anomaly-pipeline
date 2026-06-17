@@ -87,9 +87,7 @@ def _run_scenario(config_name: str):
     resolved_sensors = []
     masks: dict[str, pd.Series] = {}
     if cfg.faults.sensor_faults:
-        sf = SensorFaultInjector().apply(
-            results, list(cfg.faults.sensor_faults), rng, wn
-        )
+        sf = SensorFaultInjector().apply(results, list(cfg.faults.sensor_faults), rng, wn)
         results = sf.results
         resolved_sensors = sf.resolved
         masks = sf.masks
@@ -168,7 +166,7 @@ def _plot_pdd_vs_dda_net3() -> Path:
     )
     ax.axhline(0, color="red", linestyle=":", alpha=0.5, label="0 m")
     ax.set_title(
-        "Net3 node \"10\" — pressure dip is bit-identical under DDA and PDD\n"
+        'Net3 node "10" — pressure dip is bit-identical under DDA and PDD\n'
         "(topology artefact, not a demand-model effect)"
     )
     ax.set_xlabel("hours")
@@ -224,9 +222,7 @@ def _plot_leak_residual_heatmap_net3() -> Path:
 
     res_base, *_ = _run_scenario("normal_net3_pdd")
     res_leak, leaks, *_ = _run_scenario("leak_abrupt_net3")
-    common_cols = sorted(
-        set(res_base.pressure.columns) & set(res_leak.pressure.columns)
-    )
+    common_cols = sorted(set(res_base.pressure.columns) & set(res_leak.pressure.columns))
     diff = res_base.pressure[common_cols] - res_leak.pressure[common_cols]
     fig, ax = plt.subplots(figsize=(12, 7))
     im = ax.imshow(
@@ -309,9 +305,7 @@ def _plot_sensor_faults_gallery() -> Path:
         ax.legend(fontsize=7, loc="best")
     for ax in axes[-1, :]:
         ax.set_xlabel("hours")
-    fig.suptitle(
-        "Sensor fault gallery — clean vs corrupted (Net3, pressure @ junction 15)"
-    )
+    fig.suptitle("Sensor fault gallery — clean vs corrupted (Net3, pressure @ junction 15)")
     fig.tight_layout()
     return _save(fig, "sensor_faults_gallery.png")
 
@@ -338,9 +332,7 @@ def _plot_sensor_fault_residuals_gallery() -> Path:
         ax.grid(True, alpha=0.3)
     for ax in axes[-1, :]:
         ax.set_xlabel("hours")
-    fig.suptitle(
-        "Sensor fault residuals — each subplot is the exact signature of its fault type"
-    )
+    fig.suptitle("Sensor fault residuals — each subplot is the exact signature of its fault type")
     fig.tight_layout()
     return _save(fig, "sensor_fault_residuals_gallery.png")
 
@@ -397,9 +389,7 @@ def _plot_cumulative_heatmap_net3() -> Path:
     handles, labels = ax.get_legend_handles_labels()
     by_label = dict(zip(labels, handles, strict=False))
     ax.legend(by_label.values(), by_label.keys(), loc="upper right")
-    ax.set_title(
-        "Net3 cumulative scenario (leak + bias sensor) — corrupted pressures over time"
-    )
+    ax.set_title("Net3 cumulative scenario (leak + bias sensor) — corrupted pressures over time")
     fig.tight_layout()
     return _save(fig, "cumulative_heatmap_net3.png")
 
@@ -474,9 +464,7 @@ def _plot_cumulative_timeline_net3() -> Path:
     ax.set_ylim(-0.6, len(rows) - 0.4)
     ax.invert_yaxis()
     ax.grid(True, axis="x", alpha=0.3)
-    ax.set_title(
-        "Cumulative scenario timeline — overlapping leak and sensor-fault windows (Net3)"
-    )
+    ax.set_title("Cumulative scenario timeline — overlapping leak and sensor-fault windows (Net3)")
     fig.tight_layout()
     return _save(fig, "cumulative_timeline_net3.png")
 
@@ -539,7 +527,7 @@ def _plot_leak_cleanup_columns() -> Path:
         )
     ax.set_ylabel("numeric columns (pressure + flowrate)")
     ax.set_title(
-        "Leak-node cleanup (D28): leak node and split-segment pipe collapsed\n"
+        "Leak-node cleanup: leak node and split-segment pipe collapsed\n"
         "back into the original network schema (Net3, leak_abrupt scenario)"
     )
     ax.grid(True, axis="y", alpha=0.3)
@@ -582,9 +570,7 @@ def _write_validation_summary() -> Path:
                 cfg_path.stem,
                 grp,
                 summary.validation.severity.upper(),
-                build_basename(
-                    summary.network_name, summary.scenario_label, summary.seed
-                ),
+                build_basename(summary.network_name, summary.scenario_label, summary.seed),
                 checks,
             )
         )
@@ -601,9 +587,7 @@ def _write_validation_summary() -> Path:
             lines.append(f"### {stem}  [{severity}]")
             lines.append(f"  basename: {basename}")
             for check_name, check_severity, detail in checks:
-                lines.append(
-                    f"  [{check_severity:>7}] {check_name}: {detail}"
-                )
+                lines.append(f"  [{check_severity:>7}] {check_name}: {detail}")
             lines.append("")
     target.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     return target

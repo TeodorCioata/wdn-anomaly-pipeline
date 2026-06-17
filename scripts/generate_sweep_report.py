@@ -1,12 +1,12 @@
 """Render docs/network_sweep_report.md from a sweep batch run.
 
-Phase 5 Week 8 (WP3). Reads the sweep configs under ``configs/sweep/``
+Phase 5 Week 8. Reads the sweep configs under ``configs/sweep/``
 and a batch summary JSON produced by ``wdn-pipeline batch`` over those
 configs, then writes a markdown report: one row per network with element
 counts, the demand mode chosen, runtime, validation severity, worst
 pressure and mass-balance residual, plus a notes column. Networks present
 in ``networks/`` but excluded from the sweep (too large for
-WNTRSimulator, decision D3) are listed separately with the exclusion
+WNTRSimulator) are listed separately with the exclusion
 reason.
 
 Usage::
@@ -140,7 +140,7 @@ def main() -> None:
             excluded.append((inp_path.name, reason))
 
     lines: list[str] = []
-    lines.append("# Network Sweep Report (Phase 5 Week 8, WP3)\n")
+    lines.append("# Network Sweep Report (Phase 5 Week 8)\n")
     lines.append(
         f"Generated from `{summary_path.relative_to(REPO_ROOT)}`. Every "
         f"LeakG3PD network at or below {args.max_junctions} junctions was run "
@@ -172,10 +172,10 @@ def main() -> None:
         lines.append("## Excluded up front\n")
         lines.append(
             "These networks load correctly but are excluded from the sweep "
-            "before running because the pure-Python WNTRSimulator (decision "
-            "D3) cannot run them: either the .inp uses Darcy-Weisbach / "
-            "Chezy-Manning headloss (WNTRSimulator is Hazen-Williams only, "
-            "D34) or the network is too large to simulate in reasonable time. "
+            "before running because the pure-Python WNTRSimulator "
+            "cannot run them: either the .inp uses Darcy-Weisbach / "
+            "Chezy-Manning headloss (WNTRSimulator is Hazen-Williams only) "
+            "or the network is too large to simulate in reasonable time. "
             "Darcy-Weisbach-capable EpanetSimulator support (which lacks leak "
             "support) is parked in the Phase 5 backlog.\n"
         )

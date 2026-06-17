@@ -98,3 +98,87 @@ def test_output_formats_must_be_unique() -> None:
 
     with pytest.raises(ValidationError):
         OutputConfig(formats=["parquet", "parquet"])
+
+
+# ---------------------------------------------------------------------------
+# Sensor-fault discriminated union
+# ---------------------------------------------------------------------------
+
+
+def _sensor_cfg(fault: dict) -> dict:
+    """Minimal config dict carrying a single sensor fault."""
+
+    return {
+        "network": {"inp_path": "Net3", "name": "net3"},
+        "simulation": {
+            "duration_seconds": 86400,
+            "hydraulic_timestep_seconds": 3600,
+            "report_timestep_seconds": 3600,
+        },
+        "scenario": {"type": "sensor_fault", "label": "x"},
+        "faults": {"sensor_faults": [fault]},
+    }
+
+
+def test_sensor_fault_unknown_type_rejected() -> None:
+    with pytest.raises(ValidationError):
+        PipelineConfig.model_validate(
+            _sensor_cfg(
+                {
+                    "type": "wibble",
+                    "target": "15",
+                    "start_time_seconds": 0,
+                    "end_time_seconds": 3600,
+                }
+            )
+        )
+
+
+def test_sensor_fault_discriminator_routes_to_concrete_class() -> None:
+    from wdn_pipeline.config import BiasFault, GainFault
+
+    cfg = PipelineConfig.model_validate(
+        _sensor_cfg(
+            {
+                "type": "gain",
+                "target": "15",
+                "gain_factor": 1.2,
+                "start_time_seconds": 0,
+                "end_time_seconds": 3600,
+            }
+        )
+    )
+    fault = cfg.faults.sensor_faults[0]
+    assert isinstance(fault, GainFault)
+    assert not isinstance(fault, BiasFault)
+    assert fault.gain_factor == 1.2
+
+
+@pytest.mark.parametrize(
+    ("fault", "foreign_field"),
+    [
+        ({"type": "bias", "bias_value": 1.0}, "sigma"),
+        ({"type": "drift", "slope_per_second": 0.1}, "gain_factor"),
+        ({"type": "stuck"}, "bias_value"),
+        ({"type": "dropout", "intervals": [[0, 1800]]}, "sigma"),
+        ({"type": "noise", "sigma": 1.0}, "bias_value"),
+        ({"type": "gain", "gain_factor": 1.2}, "slope_per_second"),
+    ],
+)
+def test_sensor_subtype_rejects_foreign_field(fault: dict, foreign_field: str) -> None:
+    """Each subtype forbids fields belonging to other fault types.
+
+    Before the discriminated-union migration the single all-optional model
+    silently accepted (and ignored) a foreign field; now the routed
+    subtype rejects it via the inherited ``extra='forbid'``.
+    """
+
+    fault = {
+        **fault,
+        "target": "15",
+        "start_time_seconds": 0,
+        "end_time_seconds": 3600,
+        foreign_field: 1.0,
+    }
+    with pytest.raises(ValidationError, match="not permitted"):
+        PipelineConfig.model_validate(_sensor_cfg(fault))

@@ -32,6 +32,7 @@ _VALUE_TABLES = {
     "flowrate": "flowrate_long",
     "demand": "demand_long",
     "leak_demand": "leak_demand_long",
+    "quality": "quality_long",
 }
 
 
@@ -70,9 +71,7 @@ class DatasetQuery:
     # -- helpers -----------------------------------------------------------
 
     @staticmethod
-    def _scenario_list(
-        scenario: str | None, scenarios: list[str] | None
-    ) -> list[str] | None:
+    def _scenario_list(scenario: str | None, scenarios: list[str] | None) -> list[str] | None:
         out: list[str] = []
         if scenario is not None:
             out.append(scenario)
@@ -186,9 +185,7 @@ class DatasetQuery:
     ) -> pd.DataFrame:
         """Slice pressure (node-addressed). All filters optional."""
 
-        return self._query_value(
-            "pressure", scenario, scenarios, nodes, t_start, t_end, wide
-        )
+        return self._query_value("pressure", scenario, scenarios, nodes, t_start, t_end, wide)
 
     def flowrate(
         self,
@@ -201,9 +198,7 @@ class DatasetQuery:
     ) -> pd.DataFrame:
         """Slice flowrate (link-addressed). All filters optional."""
 
-        return self._query_value(
-            "flowrate", scenario, scenarios, links, t_start, t_end, wide
-        )
+        return self._query_value("flowrate", scenario, scenarios, links, t_start, t_end, wide)
 
     def demand(
         self,
@@ -216,9 +211,7 @@ class DatasetQuery:
     ) -> pd.DataFrame:
         """Slice delivered demand (node-addressed)."""
 
-        return self._query_value(
-            "demand", scenario, scenarios, nodes, t_start, t_end, wide
-        )
+        return self._query_value("demand", scenario, scenarios, nodes, t_start, t_end, wide)
 
     def leak_demand(
         self,
@@ -231,9 +224,25 @@ class DatasetQuery:
     ) -> pd.DataFrame:
         """Slice leak outflow (node-addressed)."""
 
-        return self._query_value(
-            "leak_demand", scenario, scenarios, nodes, t_start, t_end, wide
-        )
+        return self._query_value("leak_demand", scenario, scenarios, nodes, t_start, t_end, wide)
+
+    def quality(
+        self,
+        scenario: str | None = None,
+        scenarios: list[str] | None = None,
+        nodes: list[str] | None = None,
+        t_start: int | None = None,
+        t_end: int | None = None,
+        wide: bool = False,
+    ) -> pd.DataFrame:
+        """Slice water quality (node-addressed).
+
+        Populated only for scenarios that ran a water quality analysis
+        (chemical / age / trace). Units follow the analysis: mg/L for
+        chemical, seconds for age, percent for trace.
+        """
+
+        return self._query_value("quality", scenario, scenarios, nodes, t_start, t_end, wide)
 
     # -- labels and masks --------------------------------------------------
 

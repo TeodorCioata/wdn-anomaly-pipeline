@@ -1,8 +1,8 @@
 """Serialise simulation results to disk.
 
-The writer set is extensible (decision D6). Phase 5 Week 7 adds a
+The writer set is extensible. Phase 5 Week 7 adds a
 :class:`DuckDBWriter` alongside the existing Parquet and CSV backends
-(decision D30: consolidated, materialised tables). The DuckDB writer is
+(consolidated, materialised tables). The DuckDB writer is
 opt-in via :attr:`OutputConfig.duckdb` and writes each scenario's tables
 into a single shared file using a ``{basename}_{table}`` namespace, so a
 batch run produces one queryable database.
@@ -52,6 +52,13 @@ TABLE_NAMES = (
     "flowrate_clean",
 )
 
+# Tables that appear only for some scenario types. ``quality`` is emitted
+# only on the EpanetSimulator (water quality) path. The parallel-batch
+# DuckDB re-import matches parquet files against ALL_TABLE_NAMES so these
+# optional tables are not dropped when consolidating from worker output.
+OPTIONAL_TABLE_NAMES = ("quality",)
+ALL_TABLE_NAMES = TABLE_NAMES + OPTIONAL_TABLE_NAMES
+
 
 @dataclass(frozen=True)
 class WriteResult:
@@ -64,8 +71,9 @@ class WriteResult:
 class Writer(ABC):
     """Abstract serialisation backend.
 
-    Each backend writes the three tables (pressure, flowrate, demand)
-    as a single file or set of files keyed by ``basename``.
+    Each backend writes the scenario's tables (pressure, flowrate, demand,
+    leak_demand, the clean siblings and an optional quality table) as a
+    file or set of files keyed by ``basename``.
     """
 
     extension: str
@@ -103,7 +111,9 @@ class ParquetWriter(Writer):
         meta_yaml = yaml.safe_dump(metadata, sort_keys=True).encode("utf-8")
         for table_name, df in tables.items():
             target = directory / f"{basename}_{table_name}.parquet"
-            arrow_table = pa.Table.from_pandas(df.reset_index().rename(columns={"index": "time_seconds"}))
+            arrow_table = pa.Table.from_pandas(
+                df.reset_index().rename(columns={"index": "time_seconds"})
+            )
             arrow_table = arrow_table.replace_schema_metadata(
                 {b"wdn_pipeline": meta_yaml, b"table": table_name.encode("utf-8")}
             )
@@ -170,7 +180,7 @@ def _ensure_scenarios_table(con: duckdb.DuckDBPyConnection) -> None:
 
 
 # Wide table name -> long table name for the value (node/link) tables. The
-# long tables (decision D32, Week 8) are additive: they accumulate every
+# long tables (Week 8) are additive: they accumulate every
 # scenario's measurements in (scenario_basename, time_seconds, name,
 # value) form so the query layer can slice across scenarios efficiently
 # without UNION-ing per-scenario wide tables. The clean-signal siblings
@@ -181,6 +191,7 @@ LONG_VALUE_TABLES = {
     "flowrate": "flowrate_long",
     "demand": "demand_long",
     "leak_demand": "leak_demand_long",
+    "quality": "quality_long",
 }
 
 LONG_TABLE_DDLS = {
@@ -200,6 +211,10 @@ LONG_TABLE_DDLS = {
         "CREATE TABLE IF NOT EXISTS leak_demand_long "
         "(scenario_basename VARCHAR, time_seconds BIGINT, name VARCHAR, value DOUBLE)"
     ),
+    "quality_long": (
+        "CREATE TABLE IF NOT EXISTS quality_long "
+        "(scenario_basename VARCHAR, time_seconds BIGINT, name VARCHAR, value DOUBLE)"
+    ),
     "labels_long": (
         "CREATE TABLE IF NOT EXISTS labels_long "
         "(scenario_basename VARCHAR, time_seconds BIGINT, label TINYINT)"
@@ -210,8 +225,8 @@ LONG_TABLE_DDLS = {
     ),
 }
 
-# Indexes on (scenario_basename, name, time_seconds) per decision D32:
-# point/range lookups for one scenario and channel over a time window.
+# Indexes on (scenario_basename, name, time_seconds): point/range
+# lookups for one scenario and channel over a time window.
 LONG_TABLE_INDEXES = {
     "pressure_long": "CREATE INDEX IF NOT EXISTS idx_pressure_long "
     "ON pressure_long(scenario_basename, name, time_seconds)",
@@ -221,6 +236,8 @@ LONG_TABLE_INDEXES = {
     "ON demand_long(scenario_basename, name, time_seconds)",
     "leak_demand_long": "CREATE INDEX IF NOT EXISTS idx_leak_demand_long "
     "ON leak_demand_long(scenario_basename, name, time_seconds)",
+    "quality_long": "CREATE INDEX IF NOT EXISTS idx_quality_long "
+    "ON quality_long(scenario_basename, name, time_seconds)",
     "labels_long": "CREATE INDEX IF NOT EXISTS idx_labels_long "
     "ON labels_long(scenario_basename, time_seconds)",
     "masks_long": "CREATE INDEX IF NOT EXISTS idx_masks_long "
@@ -237,7 +254,9 @@ def _ensure_long_tables(con: duckdb.DuckDBPyConnection) -> None:
         con.execute(ddl)
 
 
-def _melt_for_long(df: pd.DataFrame, value_cols: list[str], var_name: str, value_name: str) -> pd.DataFrame:
+def _melt_for_long(
+    df: pd.DataFrame, value_cols: list[str], var_name: str, value_name: str
+) -> pd.DataFrame:
     """Melt selected columns of a time-indexed table into long form."""
 
     long_df = (
@@ -393,8 +412,8 @@ class DuckDBWriter:
                 ``scenarios`` row.
             config_path: Optional config path recorded into the
                 ``scenarios`` row for traceability.
-            wide_tables: When true (default, D30) write the per-scenario
-                wide tables. When false (D35) write only the consolidated
+            wide_tables: When true (default) write the per-scenario
+                wide tables. When false write only the consolidated
                 long tables and the ``scenarios`` row, keeping a large
                 consolidated file compact (each wide table otherwise
                 costs a DuckDB storage block).
@@ -411,20 +430,15 @@ class DuckDBWriter:
             if wide_tables:
                 for table_name, df in tables.items():
                     full_table = f"{basename}_{table_name}"
-                    df_to_write = df.reset_index().rename(
-                        columns={"index": "time_seconds"}
-                    )
+                    df_to_write = df.reset_index().rename(columns={"index": "time_seconds"})
                     con.register("_wdn_pipeline_tmp_df", df_to_write)
                     con.execute(f'DROP TABLE IF EXISTS "{full_table}"')
                     con.execute(
-                        f'CREATE TABLE "{full_table}" AS '
-                        "SELECT * FROM _wdn_pipeline_tmp_df"
+                        f'CREATE TABLE "{full_table}" AS SELECT * FROM _wdn_pipeline_tmp_df'
                     )
                     con.unregister("_wdn_pipeline_tmp_df")
             _populate_long_tables(con, basename, tables)
-            _upsert_scenario_row(
-                con, basename, metadata, validation_severity, config_path
-            )
+            _upsert_scenario_row(con, basename, metadata, validation_severity, config_path)
         return db_path
 
 
@@ -432,12 +446,23 @@ def build_basename(network_name: str, scenario_label: str, seed: int) -> str:
     """Filename stem for one scenario.
 
     Format: ``{network}_{scenario}_{seed}``. May be revisited if batch
-    runs need uniqueness across re-runs (decision D11).
+    runs need uniqueness across re-runs.
+
+    The basename becomes both a filename stem and a quoted DuckDB
+    identifier (``"{basename}_pressure"``), so a double quote or control
+    character in the network name or scenario label is rejected here rather
+    than breaking the identifier or the path downstream.
     """
 
     safe_label = scenario_label.replace(" ", "_").replace("/", "-")
     safe_network = network_name.replace(" ", "_").replace("/", "-")
-    return f"{safe_network}_{safe_label}_{seed}"
+    basename = f"{safe_network}_{safe_label}_{seed}"
+    if '"' in basename or any(ord(c) < 32 for c in basename):
+        raise ValueError(
+            f"Unsafe scenario basename {basename!r}: the network name and scenario "
+            "label must not contain double quotes or control characters."
+        )
+    return basename
 
 
 def assemble_tables(
@@ -448,9 +473,12 @@ def assemble_tables(
     """Attach the per-timestep label column to every table.
 
     The label is the same column repeated across pressure / flowrate /
-    demand to make every table independently filterable.
+    demand to make every table independently filterable. A ``quality``
+    table is added when the scenario ran a water quality analysis
+    (EpanetSimulator path); a no-quality run produces the original table
+    set unchanged.
 
-    Per-channel sensor-fault masks (D22, D26) are appended to the
+    Per-channel sensor-fault masks are appended to the
     matching corrupted table: a pressure fault's mask column is added
     to ``pressure``, a flowrate fault's mask is added to ``flowrate``.
     Mask column names follow ``{fault_type}_mask_{target}``. The
@@ -466,6 +494,15 @@ def assemble_tables(
         df["label"] = labels.timestep_labels.reindex(df.index).fillna(0).astype("int8")
         out[name] = df
 
+    # The quality table is present only on the EpanetSimulator path; a
+    # no-quality run produces exactly the original table set.
+    if results.quality is not None:
+        quality_df = results.quality.copy()
+        quality_df["label"] = (
+            labels.timestep_labels.reindex(quality_df.index).fillna(0).astype("int8")
+        )
+        out["quality"] = quality_df
+
     if sensor_masks:
         for mask_name, mask_series in sensor_masks.items():
             # Names follow {type}_mask_{target}. We dispatch to the
@@ -478,15 +515,11 @@ def assemble_tables(
             target = mask_name.split("_mask_", 1)[1] if "_mask_" in mask_name else None
             if target is not None and target in out["pressure"].columns:
                 out["pressure"][mask_name] = (
-                    mask_series.reindex(out["pressure"].index)
-                    .fillna(False)
-                    .astype(bool)
+                    mask_series.reindex(out["pressure"].index).fillna(False).astype(bool)
                 )
             if target is not None and target in out["flowrate"].columns:
                 out["flowrate"][mask_name] = (
-                    mask_series.reindex(out["flowrate"].index)
-                    .fillna(False)
-                    .astype(bool)
+                    mask_series.reindex(out["flowrate"].index).fillna(False).astype(bool)
                 )
     return out
 
@@ -521,7 +554,7 @@ def write_outputs(
     When ``duckdb_path`` is provided the scenario's tables are also
     inserted into the DuckDB file under the ``{basename}_{table}``
     namespace and a row is upserted into the ``scenarios`` metadata
-    table (decision D30). DuckDB is additive: the parquet/csv outputs
+    table. DuckDB is additive: the parquet/csv outputs
     are written exactly as before.
     """
 

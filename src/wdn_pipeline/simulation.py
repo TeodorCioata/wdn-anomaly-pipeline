@@ -9,6 +9,8 @@ the project's target scale.
 
 from __future__ import annotations
 
+import os
+import tempfile
 import time
 from dataclasses import dataclass
 
@@ -46,6 +48,11 @@ class SimulationResults:
             present; equals ``pressure`` when no sensor faults run.
         flowrate_clean: Uncorrupted flowrate ground truth. Always
             present; equals ``flowrate`` when no sensor faults run.
+        quality: Water quality time-series (rows = time, columns = node
+            names) when a quality analysis ran through the
+            ``EpanetSimulator``. ``None`` for the default WNTRSimulator
+            path. Units depend on the quality parameter: mg/L for
+            chemical, seconds for age, percent for trace.
     """
 
     pressure: pd.DataFrame
@@ -55,19 +62,63 @@ class SimulationResults:
     elapsed_seconds: float
     pressure_clean: pd.DataFrame
     flowrate_clean: pd.DataFrame
+    quality: pd.DataFrame | None = None
 
 
-def run_simulation(wn: WaterNetworkModel) -> SimulationResults:
-    """Execute the simulation and unpack pressure, flowrate, demand and leak demand.
+def run_simulation(
+    wn: WaterNetworkModel, use_epanet_for_quality: bool = False
+) -> SimulationResults:
+    """Execute the simulation and unpack the time-series tables.
 
     The supplied model is consumed by the simulator; do not call this
     twice on the same model.
+
+    Args:
+        wn: The prepared water network model.
+        use_epanet_for_quality: When true the scenario runs through the
+            ``EpanetSimulator`` so a water quality analysis is produced
+            (the default ``WNTRSimulator`` emits no quality table). Only
+            valid for scenarios without leaks; the config validator
+            enforces that. The whole scenario, including the hydraulics,
+            is then solved by EPANET.
+
+    Returns:
+        A :class:`SimulationResults`. ``quality`` is populated only on
+        the EpanetSimulator path.
     """
 
-    simulator = wntr.sim.WNTRSimulator(wn)
     started = time.perf_counter()
-    results = simulator.run_sim()
+    if use_epanet_for_quality:
+        simulator = wntr.sim.EpanetSimulator(wn)
+        # Run in a private temp directory so the EPANET .inp/.rpt/.bin/.hyd
+        # scratch files never land in the working directory or collide
+        # between concurrent runs.
+        with tempfile.TemporaryDirectory(prefix="wdn_epanet_") as tmp:
+            results = simulator.run_sim(file_prefix=os.path.join(tmp, "run"))
+    else:
+        simulator = wntr.sim.WNTRSimulator(wn)
+        results = simulator.run_sim()
     elapsed = time.perf_counter() - started
+
+    # Genuine non-convergence (max trials exceeded or no solution) is
+    # reported by the simulator as a non-None error_code: both the
+    # WNTRSimulator and the EpanetSimulator reader set
+    # ``ResultsStatus.error``, which equals 0 -- so the guard must test
+    # ``is not None`` rather than truthiness, or a non-converged run would
+    # be silently treated as valid. Benign EPANET warnings (negative
+    # pressures under DDA, disconnected nodes) leave error_code at None and
+    # still flow through to the validators as warnings rather than erroring
+    # here. This catches a solve that returned rows but did not converge,
+    # which the zero-timestep guard below would miss.
+    error_code = getattr(results, "error_code", None)
+    if error_code is not None:
+        raise RuntimeError(
+            "Simulation did not converge: the solver reported a non-success "
+            f"status (error_code={error_code!r}), commonly a max-trials-exceeded "
+            "or no-solution state under PDD on an uncalibrated or ill-posed "
+            "network. Treat this network as incompatible with the current "
+            "simulation settings."
+        )
 
     pressure = results.node["pressure"].copy()
     # A WNTRSimulator run that fails to converge can return a results
@@ -88,10 +139,13 @@ def run_simulation(wn: WaterNetworkModel) -> SimulationResults:
     if "leak_demand" in results.node:
         leak_demand = results.node["leak_demand"].copy()
     else:
-        # Older WNTR releases or no-leak scenarios: emit a zero frame
-        # aligned with the pressure index/columns so downstream code
-        # never has to special-case absence.
+        # Older WNTR releases, no-leak scenarios or the EpanetSimulator
+        # path (no leak support): emit a zero frame aligned with the
+        # pressure index/columns so downstream code never has to
+        # special-case absence.
         leak_demand = pd.DataFrame(0.0, index=pressure.index, columns=pressure.columns)
+
+    quality = results.node["quality"].copy() if "quality" in results.node else None
 
     return SimulationResults(
         pressure=pressure,
@@ -101,4 +155,5 @@ def run_simulation(wn: WaterNetworkModel) -> SimulationResults:
         elapsed_seconds=elapsed,
         pressure_clean=pressure.copy(),
         flowrate_clean=flowrate.copy(),
+        quality=quality,
     )

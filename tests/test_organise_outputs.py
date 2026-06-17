@@ -89,9 +89,7 @@ def test_organise_one_produces_expected_tree(organise_module, tmp_path: Path) ->
     assert (scenario_dir / "metadata.yaml").is_file()
 
 
-def test_organise_one_strips_clean_tables_for_normal(
-    organise_module, tmp_path: Path
-) -> None:
+def test_organise_one_strips_clean_tables_for_normal(organise_module, tmp_path: Path) -> None:
     """A normal scenario must not carry ``*_clean`` siblings into the tree.
 
     They are present in the parquet outputs because the pipeline always

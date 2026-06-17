@@ -1,0 +1,54 @@
+# Normal scenario on Net3 with a chemical (chlorine) decay analysis.
+#
+# Demonstrates the water quality option surface. Water quality runs
+# through the EpanetSimulator, which (unlike the WNTRSimulator used for
+# leaks) has no leak support, so a quality analysis is only valid for
+# scenarios without leaks. The whole scenario, hydraulics included, is
+# solved by EPANET; the pressure/flowrate/demand tables therefore come
+# from EPANET for this run.
+#
+# Chlorine is injected at both reservoirs at 1.0 mg/L and decays as it
+# travels through the network (first-order bulk reaction). Quality is
+# written as an extra `quality` output table (mg/L), queryable through
+# the same long tables as pressure/flowrate.
+
+network:
+  inp_path: Net3
+  name: net3
+
+simulation:
+  duration_seconds: 86400          # 24 hours
+  hydraulic_timestep_seconds: 3600 # 1 hour
+  report_timestep_seconds: 3600
+  demand_model: DDA
+
+  quality:
+    parameter: chemical
+    chemical_name: chlorine
+    # Bulk reaction coefficient in WNTR units (per second; converted to
+    # EPANET 1/day on write). Negative = decay. -1.157e-05 /s ~= -1.0/day,
+    # a moderate, realistic chlorine decay rate.
+    bulk_coeff: -0.00001157
+    diffusivity: 1.0
+    quality_timestep_seconds: 300
+    sources:
+      - node: River
+        source_type: CONCEN   # set concentration of inflow to 1.0 mg/L
+        strength: 1.0
+      - node: Lake
+        source_type: CONCEN
+        strength: 1.0
+
+seed: 42
+
+demand:
+  mode: default
+
+scenario:
+  type: normal
+  label: normal_chemical
+
+output:
+  directory: outputs
+  formats: [parquet, csv]
+  write_metadata_sidecar: true

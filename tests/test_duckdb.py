@@ -1,4 +1,4 @@
-"""Tests for the DuckDB writer (decision D30, Phase 5 Week 7)."""
+"""Tests for the DuckDB writer (Phase 5 Week 7)."""
 
 from __future__ import annotations
 
@@ -96,6 +96,7 @@ def test_single_scenario_writes_duckdb(tmp_path: Path) -> None:
         "flowrate_long",
         "demand_long",
         "leak_demand_long",
+        "quality_long",
         "labels_long",
         "masks_long",
     }
@@ -148,23 +149,17 @@ def test_duckdb_table_roundtrip_matches_parquet(tmp_path: Path) -> None:
     cfg = load_config(cfg_path)
     summary = run(cfg, config_path=str(cfg_path))
 
-    pressure_parquet = next(
-        p for p in summary.output_paths if p.name.endswith("pressure.parquet")
-    )
+    pressure_parquet = next(p for p in summary.output_paths if p.name.endswith("pressure.parquet"))
     df_parquet = pq.read_table(pressure_parquet).to_pandas()
 
     con = duckdb.connect(str(db_path))
-    df_duck = con.execute(
-        'SELECT * FROM "net3_rt_3_pressure" ORDER BY time_seconds'
-    ).fetchdf()
+    df_duck = con.execute('SELECT * FROM "net3_rt_3_pressure" ORDER BY time_seconds').fetchdf()
 
     assert set(df_parquet.columns) == set(df_duck.columns)
     df_parquet = df_parquet.sort_values("time_seconds").reset_index(drop=True)
     df_duck = df_duck.sort_values("time_seconds").reset_index(drop=True)
     # Pressure columns are floats; compare numerically.
-    numeric_cols = [
-        c for c in df_parquet.columns if df_parquet[c].dtype.kind in {"f", "i"}
-    ]
+    numeric_cols = [c for c in df_parquet.columns if df_parquet[c].dtype.kind in {"f", "i"}]
     for col in numeric_cols:
         assert np.allclose(
             df_parquet[col].to_numpy(),
@@ -176,9 +171,7 @@ def test_duckdb_table_roundtrip_matches_parquet(tmp_path: Path) -> None:
 
 def test_batch_consolidates_three_scenarios_into_one_duckdb(tmp_path: Path) -> None:
     db_path = tmp_path / "batch.duckdb"
-    configs = [
-        _normal_net3_config(tmp_path, f"b{i}", seed=20 + i) for i in range(3)
-    ]
+    configs = [_normal_net3_config(tmp_path, f"b{i}", seed=20 + i) for i in range(3)]
     summary = run_batch(
         configs,
         tmp_path / "report",
@@ -213,9 +206,7 @@ def test_batch_consolidates_three_scenarios_into_one_duckdb(tmp_path: Path) -> N
 def test_batch_duckdb_parallel_produces_same_tables_as_sequential(
     tmp_path: Path,
 ) -> None:
-    configs = [
-        _normal_net3_config(tmp_path, f"p{i}", seed=30 + i) for i in range(3)
-    ]
+    configs = [_normal_net3_config(tmp_path, f"p{i}", seed=30 + i) for i in range(3)]
     seq_db = tmp_path / "seq.duckdb"
     par_db = tmp_path / "par.duckdb"
     run_batch(configs, tmp_path / "seq_report", batch_id="seq", duckdb_path=seq_db)
@@ -277,6 +268,7 @@ def test_duckdb_writer_direct_api(tmp_path: Path) -> None:
         "flowrate_long",
         "demand_long",
         "leak_demand_long",
+        "quality_long",
         "labels_long",
         "masks_long",
     }
@@ -292,7 +284,7 @@ def test_duckdb_writer_direct_api(tmp_path: Path) -> None:
 
 
 def test_duckdb_long_only_skips_wide_tables(tmp_path: Path) -> None:
-    """``wide_tables=False`` (D35) writes long tables + scenarios only."""
+    """``wide_tables=False`` writes long tables + scenarios only."""
 
     import pandas as pd
 

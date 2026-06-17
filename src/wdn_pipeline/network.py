@@ -27,7 +27,7 @@ from wdn_pipeline.config import NetworkConfig, SimulationConfig
 warnings.filterwarnings("ignore", category=UserWarning, module="wntr")
 
 # Calibration fields on SimulationConfig that map one-to-one onto a
-# ``wn.options.hydraulic`` attribute of the same name (decision D33).
+# ``wn.options.hydraulic`` attribute of the same name.
 _CALIBRATION_FIELDS = (
     "viscosity",
     "specific_gravity",
@@ -109,7 +109,7 @@ def load_network(network_cfg: NetworkConfig, simulation_cfg: SimulationConfig) -
 def apply_hydraulic_options(
     wn: WaterNetworkModel, simulation_cfg: SimulationConfig
 ) -> list[HydraulicOverride]:
-    """Apply calibration overrides onto a loaded model (decision D33).
+    """Apply calibration overrides onto a loaded model.
 
     Calibration is split out from :func:`load_network` so the override
     provenance can be returned to the runner and recorded in the run
@@ -134,16 +134,15 @@ def apply_hydraulic_options(
             ``wn.options.hydraulic`` attribute.
     """
 
-    # WNTRSimulator (used always, decision D3) only implements
-    # Hazen-Williams. Reject D-W/C-M headloss overrides loudly rather
-    # than letting WNTRSimulator raise a cryptic NotImplementedError mid
-    # simulation (decision D34).
+    # WNTRSimulator (used always) only implements Hazen-Williams. Reject
+    # D-W/C-M headloss overrides loudly rather than letting WNTRSimulator
+    # raise a cryptic NotImplementedError mid simulation.
     if simulation_cfg.headloss is not None and simulation_cfg.headloss != "H-W":
         raise ValueError(
             f"simulation.headloss='{simulation_cfg.headloss}' is not supported: "
-            "the pipeline always uses WNTRSimulator (D3), which only implements "
+            "the pipeline always uses WNTRSimulator, which only implements "
             "Hazen-Williams ('H-W'). Darcy-Weisbach / Chezy-Manning would require "
-            "the EpanetSimulator, which has no leak support (D34)."
+            "the EpanetSimulator, which has no leak support."
         )
 
     overrides: list[HydraulicOverride] = []
@@ -160,13 +159,101 @@ def apply_hydraulic_options(
             raise ValueError(
                 f"Unknown WNTR hydraulic option '{key}' in "
                 f"simulation.extra_hydraulic_options. It is not an attribute "
-                f"of wn.options.hydraulic (D33: typos fail loudly)."
+                f"of wn.options.hydraulic. Typos fail loudly rather than "
+                "being silently ignored."
             )
         inp_value = getattr(wn.options.hydraulic, key)
         setattr(wn.options.hydraulic, key, value)
         overrides.append(HydraulicOverride(key, inp_value, value))
 
     return overrides
+
+
+def apply_quality_options(wn: WaterNetworkModel, simulation_cfg: SimulationConfig) -> dict:
+    """Apply water quality options onto a loaded model.
+
+    Water quality runs through the ``EpanetSimulator`` (the
+    ``WNTRSimulator`` produces no quality table), so this is only
+    meaningful for scenarios without leaks; the config validator already
+    rejects a leak + quality combination. Node references (``trace_node``
+    and source nodes) are validated against the loaded network here
+    because the network is not available at config-load time, mirroring
+    sensor-target validation.
+
+    Args:
+        wn: A loaded ``WaterNetworkModel``. Mutated in place.
+        simulation_cfg: The simulation config carrying ``quality``.
+
+    Returns:
+        A dictionary describing the settings actually applied (empty when
+        quality is disabled), suitable for the run summary and the
+        metadata sidecar. Chemical sources are returned under a
+        ``sources`` key with the generated source/pattern names.
+
+    Raises:
+        ValueError: If ``trace_node`` or a source node is not a node of
+            the loaded network.
+    """
+
+    q = simulation_cfg.quality
+    if not q.enabled:
+        return {}
+
+    wn.options.quality.parameter = q.parameter.upper()
+    applied: dict = {"parameter": q.parameter}
+
+    if q.quality_timestep_seconds is not None:
+        wn.options.time.quality_timestep = q.quality_timestep_seconds
+        applied["quality_timestep_seconds"] = q.quality_timestep_seconds
+
+    if q.parameter == "trace":
+        if q.trace_node not in wn.node_name_list:
+            raise ValueError(
+                f"simulation.quality.trace_node '{q.trace_node}' is not a node "
+                "of the loaded network"
+            )
+        wn.options.quality.trace_node = q.trace_node
+        applied["trace_node"] = q.trace_node
+    elif q.parameter == "chemical":
+        if q.chemical_name is not None:
+            wn.options.quality.chemical_name = q.chemical_name
+            applied["chemical_name"] = q.chemical_name
+        if q.diffusivity is not None:
+            wn.options.quality.diffusivity = q.diffusivity
+            applied["diffusivity"] = q.diffusivity
+        if q.bulk_coeff is not None:
+            wn.options.reaction.bulk_coeff = q.bulk_coeff
+            applied["bulk_coeff"] = q.bulk_coeff
+        if q.wall_coeff is not None:
+            wn.options.reaction.wall_coeff = q.wall_coeff
+            applied["wall_coeff"] = q.wall_coeff
+        sources_applied: list[dict] = []
+        for i, src in enumerate(q.sources):
+            if src.node not in wn.node_name_list:
+                raise ValueError(
+                    f"simulation.quality.sources[{i}].node '{src.node}' is not a "
+                    "node of the loaded network"
+                )
+            pattern_name: str | None = None
+            if src.pattern is not None:
+                pattern_name = f"wq_source_{i}_pattern"
+                wn.add_pattern(pattern_name, list(src.pattern))
+            source_name = f"wq_source_{i}"
+            wn.add_source(source_name, src.node, src.source_type, src.strength, pattern_name)
+            sources_applied.append(
+                {
+                    "name": source_name,
+                    "node": src.node,
+                    "source_type": src.source_type,
+                    "strength": src.strength,
+                    "pattern": pattern_name,
+                }
+            )
+        if sources_applied:
+            applied["sources"] = sources_applied
+    # 'age' needs no further options beyond the parameter.
+
+    return applied
 
 
 def derive_network_name(network_cfg: NetworkConfig) -> str:

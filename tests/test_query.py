@@ -1,4 +1,4 @@
-"""Tests for the DuckDB query layer (Phase 5 Week 8, WP1, D32)."""
+"""Tests for the DuckDB query layer (Phase 5 Week 8)."""
 
 from __future__ import annotations
 
@@ -15,7 +15,9 @@ from wdn_pipeline.runner import app, run
 runner = CliRunner()
 
 
-def _cfg(out_dir: Path, db: Path, label: str, scenario_type: str, seed: int, faults: dict | None) -> PipelineConfig:
+def _cfg(
+    out_dir: Path, db: Path, label: str, scenario_type: str, seed: int, faults: dict | None
+) -> PipelineConfig:
     body: dict = {
         "network": {"inp_path": "Net3", "name": "net3"},
         "simulation": {
@@ -107,9 +109,7 @@ def test_time_window_is_half_open(query_db: Path) -> None:
 
 def test_composed_filters(query_db: Path) -> None:
     with DatasetQuery(query_db) as q:
-        df = q.pressure(
-            scenario="net3_normal_0", nodes=["10"], t_start=0, t_end=3600
-        )
+        df = q.pressure(scenario="net3_normal_0", nodes=["10"], t_start=0, t_end=3600)
     assert set(df["name"]) == {"10"}
     assert sorted(df["time_seconds"].unique()) == [0]
 
@@ -125,8 +125,7 @@ def test_wide_roundtrips_against_wide_table(query_db: Path) -> None:
         wide = q.pressure(scenario="net3_normal_0", nodes=["10", "15"], wide=True)
         # Compare against the per-scenario wide table directly.
         ref = q.sql(
-            'SELECT time_seconds, "10", "15" FROM net3_normal_0_pressure '
-            "ORDER BY time_seconds"
+            'SELECT time_seconds, "10", "15" FROM net3_normal_0_pressure ORDER BY time_seconds'
         ).set_index("time_seconds")
     assert wide.index.name == "time_seconds"
     assert list(wide.columns) == ["10", "15"]
@@ -186,9 +185,7 @@ def test_long_table_agrees_with_wide_sampled(query_db: Path) -> None:
             "SELECT value FROM pressure_long WHERE scenario_basename='net3_leak_a_1' "
             "AND name='10' AND time_seconds=3600"
         )["value"][0]
-        wide_val = q.sql('SELECT "10" FROM net3_leak_a_1_pressure WHERE time_seconds=3600')[
-            "10"
-        ][0]
+        wide_val = q.sql('SELECT "10" FROM net3_leak_a_1_pressure WHERE time_seconds=3600')["10"][0]
     assert long_val == pytest.approx(wide_val)
 
 
@@ -203,9 +200,20 @@ def test_cli_slice_to_csv(query_db: Path, tmp_path: Path) -> None:
     result = runner.invoke(
         app,
         [
-            "query", str(query_db), "--quantity", "pressure",
-            "--scenario", "net3_normal_0", "--nodes", "10,15",
-            "--t-start", "0", "--t-end", "3600", "--out", str(out),
+            "query",
+            str(query_db),
+            "--quantity",
+            "pressure",
+            "--scenario",
+            "net3_normal_0",
+            "--nodes",
+            "10,15",
+            "--t-start",
+            "0",
+            "--t-end",
+            "3600",
+            "--out",
+            str(out),
         ],
     )
     assert result.exit_code == 0
@@ -223,8 +231,16 @@ def test_cli_scenario_type_slice_to_parquet(query_db: Path, tmp_path: Path) -> N
     result = runner.invoke(
         app,
         [
-            "query", str(query_db), "--quantity", "pressure",
-            "--scenario-type", "leak", "--nodes", "10", "--out", str(out),
+            "query",
+            str(query_db),
+            "--quantity",
+            "pressure",
+            "--scenario-type",
+            "leak",
+            "--nodes",
+            "10",
+            "--out",
+            str(out),
         ],
     )
     assert result.exit_code == 0

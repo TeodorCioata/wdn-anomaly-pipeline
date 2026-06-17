@@ -47,33 +47,33 @@ logger = logging.getLogger("organise_outputs")
 # derived from the loaded ScenarioConfig.
 EXPLICIT_TREE_MAP: dict[str, tuple[str, str, str]] = {
     # Normal scenarios (one DDA + one PDD per network from Week 5 onwards).
-    "normal_net3":        ("normal", "net3",  "dda"),
-    "normal_net3_pdd":    ("normal", "net3",  "pdd"),
-    "normal_hanoi":       ("normal", "hanoi", "dda"),
-    "normal_hanoi_pdd":   ("normal", "hanoi", "pdd"),
-    "normal_fowm":        ("normal", "fowm",  "dda"),
-    "normal_fowm_pdd":    ("normal", "fowm",  "pdd"),
-    "normal_jilin":       ("normal", "jilin", "dda"),
-    "normal_jilin_pdd":   ("normal", "jilin", "pdd"),
+    "normal_net3": ("normal", "net3", "dda"),
+    "normal_net3_pdd": ("normal", "net3", "pdd"),
+    "normal_hanoi": ("normal", "hanoi", "dda"),
+    "normal_hanoi_pdd": ("normal", "hanoi", "pdd"),
+    "normal_fowm": ("normal", "fowm", "dda"),
+    "normal_fowm_pdd": ("normal", "fowm", "pdd"),
+    "normal_jilin": ("normal", "jilin", "dda"),
+    "normal_jilin_pdd": ("normal", "jilin", "pdd"),
     # Leak scenarios (one per profile / location strategy).
-    "leak_abrupt_net3":         ("leak", "net3",  "abrupt"),
-    "leak_abrupt_net3_clean":   ("leak", "net3",  "abrupt_clean"),
-    "leak_incipient_hanoi":     ("leak", "hanoi", "incipient"),
-    "leak_multi_jilin":         ("leak", "jilin", "multi"),
-    "leak_random_fowm":         ("leak", "fowm",  "random"),
+    "leak_abrupt_net3": ("leak", "net3", "abrupt"),
+    "leak_abrupt_net3_clean": ("leak", "net3", "abrupt_clean"),
+    "leak_incipient_hanoi": ("leak", "hanoi", "incipient"),
+    "leak_multi_jilin": ("leak", "jilin", "multi"),
+    "leak_random_fowm": ("leak", "fowm", "random"),
     # Sensor fault scenarios (one per fault type).
-    "sensor_bias_net3":     ("sensor_fault", "net3", "bias"),
-    "sensor_drift_net3":    ("sensor_fault", "net3", "drift"),
-    "sensor_stuck_net3":    ("sensor_fault", "net3", "stuck"),
-    "sensor_dropout_net3":  ("sensor_fault", "net3", "dropout"),
-    "sensor_noise_net3":    ("sensor_fault", "net3", "noise"),
-    "sensor_gain_net3":     ("sensor_fault", "net3", "gain"),
+    "sensor_bias_net3": ("sensor_fault", "net3", "bias"),
+    "sensor_drift_net3": ("sensor_fault", "net3", "drift"),
+    "sensor_stuck_net3": ("sensor_fault", "net3", "stuck"),
+    "sensor_dropout_net3": ("sensor_fault", "net3", "dropout"),
+    "sensor_noise_net3": ("sensor_fault", "net3", "noise"),
+    "sensor_gain_net3": ("sensor_fault", "net3", "gain"),
     # Cumulative scenarios (one per network).
-    "cumulative_leak_bias_net3":    ("cumulative", "net3",  "leak_bias"),
-    "cumulative_leak_drift_hanoi":  ("cumulative", "hanoi", "leak_drift"),
-    "cumulative_leak_dropout_jilin":("cumulative", "jilin", "leak_dropout"),
-    "cumulative_leak_gain_net3":    ("cumulative", "net3",  "leak_gain"),
-    "cumulative_leak_noise_fowm":   ("cumulative", "fowm",  "leak_noise"),
+    "cumulative_leak_bias_net3": ("cumulative", "net3", "leak_bias"),
+    "cumulative_leak_drift_hanoi": ("cumulative", "hanoi", "leak_drift"),
+    "cumulative_leak_dropout_jilin": ("cumulative", "jilin", "leak_dropout"),
+    "cumulative_leak_gain_net3": ("cumulative", "net3", "leak_gain"),
+    "cumulative_leak_noise_fowm": ("cumulative", "fowm", "leak_noise"),
 }
 
 
@@ -271,9 +271,7 @@ def render_readme(records: list[dict[str, object]]) -> str:
     rows.append("| Folder | Config | Severity |")
     rows.append("|---|---|---|")
     for r in sorted(records, key=lambda x: str(x["scenario_dir"])):
-        rows.append(
-            f"| `{r['scenario_dir']}` | `{r['config_path']}` | {r['severity']} |"
-        )
+        rows.append(f"| `{r['scenario_dir']}` | `{r['config_path']}` | {r['severity']} |")
     return README_TEMPLATE.format(config_table="\n".join(rows))
 
 

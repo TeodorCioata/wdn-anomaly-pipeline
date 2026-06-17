@@ -44,3 +44,42 @@ def test_no_nan_in_outputs(sim_results: SimulationResults) -> None:
     assert not sim_results.pressure.isna().any().any()
     assert not sim_results.flowrate.isna().any().any()
     assert not sim_results.demand.isna().any().any()
+
+
+def test_converged_run_has_no_error_code(sim_results: SimulationResults) -> None:
+    """A normal Net3 run converges, so real data is produced (error_code None)."""
+
+    assert sim_results.pressure.shape[0] > 0
+
+
+def test_non_convergence_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A solve that returns a non-None error_code must raise, not write data.
+
+    Both WNTRSimulator and the EpanetSimulator reader set
+    ``ResultsStatus.error`` on genuine non-convergence. That enum value is
+    ``0`` (and falsy), so the guard tests ``is not None`` rather than
+    truthiness; a naive ``if results.error_code:`` would wrongly skip it.
+    """
+
+    import wntr
+    from wntr.sim.results import ResultsStatus
+
+    # Documents why ``is not None`` is required, not plain truthiness.
+    assert ResultsStatus.error == 0
+    assert not bool(ResultsStatus.error)
+
+    cfg = SimulationConfig(
+        duration_seconds=3600,
+        hydraulic_timestep_seconds=3600,
+        report_timestep_seconds=3600,
+    )
+    wn = load_network(NetworkConfig(inp_path="Net3"), cfg)
+
+    class _FakeResults:
+        error_code = ResultsStatus.error
+
+    monkeypatch.setattr(
+        wntr.sim.WNTRSimulator, "run_sim", lambda self, *args, **kwargs: _FakeResults()
+    )
+    with pytest.raises(RuntimeError, match="did not converge"):
+        run_simulation(wn)

@@ -1,4 +1,4 @@
-"""Smoke tests for the LeakG3PD network sweep (Phase 5 Week 8, WP3).
+"""Smoke tests for the LeakG3PD network sweep (Phase 5 Week 8).
 
 These guard the sweep capability against regression: the config
 generator helpers, and a handful of representative networks (small, mid,

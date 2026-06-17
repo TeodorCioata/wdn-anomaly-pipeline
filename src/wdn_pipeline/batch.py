@@ -11,7 +11,7 @@ Two summary artefacts are produced under ``<output_root>/<batch_id>/``:
 - ``batch_summary.txt``: human-readable severity table grouped by
   scenario type.
 
-Phase 5 Week 7 adds two capabilities (decisions D30 and D31):
+Phase 5 Week 7 adds two capabilities:
 
 - ``workers > 1`` runs scenarios in parallel via a
   :class:`concurrent.futures.ProcessPoolExecutor` using the ``spawn``
@@ -39,7 +39,8 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from wdn_pipeline.config import load_config
-from wdn_pipeline.output import TABLE_NAMES, DuckDBWriter
+from wdn_pipeline.network import derive_network_name
+from wdn_pipeline.output import ALL_TABLE_NAMES, DuckDBWriter, build_basename
 from wdn_pipeline.runner import RunSummary, run
 
 logger = logging.getLogger("wdn_pipeline.batch")
@@ -92,6 +93,11 @@ class BatchSummary:
     workers: int = 1
     duckdb_path: Path | None = None
     results: list[BatchRunResult] = field(default_factory=list)
+    # Scenarios that ran successfully but whose tables could not be imported
+    # into the consolidated DuckDB file (parallel path only). Each entry is a
+    # human-readable "config: error" string. These runs still count as ok in
+    # ``results`` but are absent from the DB, so they are surfaced explicitly.
+    duckdb_import_errors: list[str] = field(default_factory=list)
 
     @property
     def elapsed_seconds(self) -> float:
@@ -165,6 +171,35 @@ def resolve_config_paths(
 def _classify_status(summary: RunSummary) -> str:
     severity = summary.validation.severity
     return severity if severity in {"ok", "warning", "fail"} else "ok"
+
+
+def _detect_basename_collisions(config_paths: list[Path]) -> None:
+    """Raise if two configs resolve to the same output basename.
+
+    Two configs sharing a ``{network}_{label}_{seed}`` basename would
+    silently overwrite each other's Parquet/CSV files and DuckDB rows. This
+    pre-flight catches that before any scenario runs. Configs that fail to
+    load are skipped here: their own run records the load error, preserving
+    the batch's per-config failure isolation.
+    """
+
+    seen: dict[str, Path] = {}
+    collisions: list[str] = []
+    for path in config_paths:
+        try:
+            cfg = load_config(path)
+        except Exception:  # noqa: BLE001 - a malformed config errors in its own run
+            continue
+        basename = build_basename(derive_network_name(cfg.network), cfg.scenario.label, cfg.seed)
+        if basename in seen:
+            collisions.append(f"{basename!r}: {seen[basename]} and {path}")
+        else:
+            seen[basename] = path
+    if collisions:
+        raise ValueError(
+            "Duplicate output basenames in batch (they would overwrite each other's "
+            "outputs and DuckDB rows):\n  " + "\n  ".join(collisions)
+        )
 
 
 def _run_one_config(
@@ -247,7 +282,7 @@ def _import_run_to_duckdb(
     basename = ""
     # Match longest table suffixes first so e.g. ``leak_demand`` wins
     # over ``demand`` when both are valid table names with a shared tail.
-    sorted_table_names = sorted(TABLE_NAMES, key=len, reverse=True)
+    sorted_table_names = sorted(ALL_TABLE_NAMES, key=len, reverse=True)
     for path in parquet_paths:
         stem = path.stem  # e.g. net3_cumulative_42_pressure
         matched_table: str | None = None
@@ -306,11 +341,11 @@ def run_batch(
         workers: Number of worker processes. ``1`` (the default) runs
             inline in the calling process. Any value above ``1`` uses
             :class:`concurrent.futures.ProcessPoolExecutor` with the
-            ``spawn`` start method (decision D31).
+            ``spawn`` start method.
         duckdb_path: Optional consolidated DuckDB file. Every scenario's
             tables are inserted under the ``{basename}_{table}``
             namespace; a ``scenarios`` metadata table records one row
-            per scenario (decision D30). In sequential mode the DuckDB
+            per scenario. In sequential mode the DuckDB
             write happens inside the runner; in parallel mode the
             workers skip DuckDB and the main process imports each
             scenario's parquet outputs on completion.
@@ -327,8 +362,14 @@ def run_batch(
 
     if batch_id is None:
         batch_id = time.strftime("%Y%m%dT%H%M%S")
+
+    # Pre-flight: reject configs that would write to the same basename and
+    # silently clobber each other's outputs before any simulation runs.
+    _detect_basename_collisions(config_paths)
+
     started = time.perf_counter()
     results: list[BatchRunResult] = []
+    duckdb_import_errors: list[str] = []
 
     if workers <= 1:
         for i, config_path in enumerate(config_paths, start=1):
@@ -337,7 +378,10 @@ def run_batch(
             if result.status == "error":
                 logger.error(
                     "[%d/%d] %s failed: %s",
-                    i, len(config_paths), config_path, result.error,
+                    i,
+                    len(config_paths),
+                    config_path,
+                    result.error,
                 )
             results.append(result)
     else:
@@ -345,18 +389,14 @@ def run_batch(
         with ProcessPoolExecutor(max_workers=workers, mp_context=spawn_ctx) as pool:
             future_to_meta: dict = {}
             for i, config_path in enumerate(config_paths, start=1):
-                future = pool.submit(
-                    _run_one_config, Path(config_path), None
-                )
+                future = pool.submit(_run_one_config, Path(config_path), None)
                 future_to_meta[future] = (i, Path(config_path))
             for future in as_completed(future_to_meta):
                 i, config_path = future_to_meta[future]
                 try:
                     result = future.result()
                 except Exception as exc:  # noqa: BLE001 - capture pool-level failures
-                    tb = "".join(
-                        traceback.format_exception_only(type(exc), exc)
-                    ).strip()
+                    tb = "".join(traceback.format_exception_only(type(exc), exc)).strip()
                     result = BatchRunResult(
                         config_path=config_path,
                         status="error",
@@ -365,8 +405,11 @@ def run_batch(
                     )
                 logger.info(
                     "[%d/%d] %s -> %s (%.2fs)",
-                    i, len(config_paths), config_path,
-                    result.status, result.elapsed_seconds,
+                    i,
+                    len(config_paths),
+                    config_path,
+                    result.status,
+                    result.elapsed_seconds,
                 )
                 if (
                     duckdb_path is not None
@@ -376,9 +419,9 @@ def run_batch(
                     try:
                         _import_run_to_duckdb(duckdb_path, result, duckdb_wide_tables)
                     except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "DuckDB import failed for %s: %s", config_path, exc,
-                        )
+                        msg = f"{config_path}: {exc}"
+                        duckdb_import_errors.append(msg)
+                        logger.warning("DuckDB import failed for %s: %s", config_path, exc)
                 results.append(result)
 
     finished = time.perf_counter()
@@ -389,6 +432,7 @@ def run_batch(
         workers=workers,
         duckdb_path=duckdb_path,
         results=results,
+        duckdb_import_errors=duckdb_import_errors,
     )
 
     json_path = report_dir / "batch_summary.json"
@@ -406,12 +450,14 @@ def _format_batch_json(summary: BatchSummary) -> str:
         "elapsed_seconds": summary.elapsed_seconds,
         "workers": summary.workers,
         "duckdb_path": str(summary.duckdb_path) if summary.duckdb_path else None,
+        "duckdb_import_errors": list(summary.duckdb_import_errors),
         "totals": {
             "total": summary.n_total,
             "ok": summary.n_ok,
             "warning": summary.n_warning,
             "fail": summary.n_fail,
             "error": summary.n_error,
+            "duckdb_import_failures": len(summary.duckdb_import_errors),
         },
         "runs": [],
     }
@@ -430,9 +476,7 @@ def _format_batch_json(summary: BatchSummary) -> str:
             entry["num_timesteps"] = r.summary.num_timesteps
             entry["output_paths"] = [str(p) for p in r.summary.output_paths]
             entry["metadata_path"] = (
-                str(r.summary.metadata_path)
-                if r.summary.metadata_path is not None
-                else None
+                str(r.summary.metadata_path) if r.summary.metadata_path is not None else None
             )
             entry["validation"] = {
                 "severity": r.summary.validation.severity,
@@ -446,9 +490,7 @@ def _format_batch_json(summary: BatchSummary) -> str:
                 ],
             }
             entry["resolved_leaks"] = len(r.summary.resolved_leaks)
-            entry["resolved_sensor_faults"] = len(
-                r.summary.resolved_sensor_faults
-            )
+            entry["resolved_sensor_faults"] = len(r.summary.resolved_sensor_faults)
             entry["interactions"] = list(r.summary.interactions)
         if r.error is not None:
             entry["error"] = r.error
@@ -471,7 +513,12 @@ def _format_batch_text(summary: BatchSummary) -> str:
     ]
     lines.append("  " + " ".join(extras))
     if summary.duckdb_path is not None:
-        lines.append(f"  duckdb={summary.duckdb_path}")
+        suffix = (
+            f" ({len(summary.duckdb_import_errors)} import failure(s))"
+            if summary.duckdb_import_errors
+            else ""
+        )
+        lines.append(f"  duckdb={summary.duckdb_path}{suffix}")
     lines.append("")
     groups: dict[str, list[BatchRunResult]] = {
         "normal": [],
@@ -491,9 +538,7 @@ def _format_batch_text(summary: BatchSummary) -> str:
             continue
         lines.append(f"[{group_name}]")
         for r in rows:
-            lines.append(
-                f"  {r.status:>7}  {r.elapsed_seconds:>6.2f}s  {r.config_path}"
-            )
+            lines.append(f"  {r.status:>7}  {r.elapsed_seconds:>6.2f}s  {r.config_path}")
         lines.append("")
     if error_rows:
         lines.append("[errors]")
@@ -502,5 +547,11 @@ def _format_batch_text(summary: BatchSummary) -> str:
             if r.error:
                 for chunk in r.error.splitlines():
                     lines.append(f"      {chunk}")
+        lines.append("")
+    if summary.duckdb_import_errors:
+        # These scenarios ran ok but never made it into the consolidated DB.
+        lines.append("[duckdb import failures]")
+        for msg in summary.duckdb_import_errors:
+            lines.append(f"  {msg}")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"

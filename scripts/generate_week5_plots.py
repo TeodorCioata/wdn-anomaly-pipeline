@@ -79,9 +79,7 @@ def _run_scenario(config_name: str):
     results = run_simulation(wn)
     resolved_sensors = []
     if cfg.faults.sensor_faults:
-        sf = SensorFaultInjector().apply(
-            results, list(cfg.faults.sensor_faults), rng, wn
-        )
+        sf = SensorFaultInjector().apply(results, list(cfg.faults.sensor_faults), rng, wn)
         results = sf.results
         resolved_sensors = sf.resolved
     return results, resolved_leaks, resolved_sensors
@@ -124,10 +122,7 @@ def _plot_pdd_vs_dda_net3() -> Path:
     ax.axhline(0.0, color="black", alpha=0.5, linewidth=0.8)
     ax.set_xlabel("time [h]")
     ax.set_ylabel('pressure at Net3 node "10" [m]')
-    ax.set_title(
-        'PDD does not resolve the Net3 node "10" artefact '
-        "(traces coincide)"
-    )
+    ax.set_title('PDD does not resolve the Net3 node "10" artefact (traces coincide)')
     ax.grid(True, alpha=0.3)
     ax.legend()
     return _save(fig, "pdd_vs_dda_pressure_net3.png")
@@ -172,8 +167,7 @@ def _plot_gain_net3() -> list[Path]:
     ax.set_xlabel("time [h]")
     ax.set_ylabel("corrupted - clean [m]")
     ax.set_title(
-        "Gain residual is proportional to the clean signal "
-        f"((gain - 1) x y, node {fault.target})"
+        f"Gain residual is proportional to the clean signal ((gain - 1) x y, node {fault.target})"
     )
     ax.grid(True, alpha=0.3)
     p2 = _save(fig, "sensor_fault_residual_gain_net3.png")
@@ -232,31 +226,21 @@ def _plot_cumulative_demand_and_mask_net3() -> Path:
     t = results.leak_demand.index.to_numpy() / 3600.0
     leak_demand = results.leak_demand[leak.leak_node_name].to_numpy()
     times = results.pressure.index.to_numpy()
-    mask = (times >= fault.start_time_seconds) & (
-        times < fault.end_time_seconds
-    )
+    mask = (times >= fault.start_time_seconds) & (times < fault.end_time_seconds)
 
     fig, ax1 = plt.subplots(figsize=(8.5, 4.0))
-    ax1.plot(
-        t, leak_demand, color="C0", linewidth=2.0, label="leak_demand"
-    )
+    ax1.plot(t, leak_demand, color="C0", linewidth=2.0, label="leak_demand")
     ax1.set_xlabel("time [h]")
     ax1.set_ylabel("leak demand [m^3/s]", color="C0")
     ax1.tick_params(axis="y", labelcolor="C0")
     ax1.grid(True, alpha=0.3)
 
     ax2 = ax1.twinx()
-    ax2.fill_between(
-        t, mask.astype(float), step="mid", alpha=0.25, color="C3"
-    )
-    ax2.set_ylabel(
-        f"{fault.type} sensor mask on {fault.target}", color="C3"
-    )
+    ax2.fill_between(t, mask.astype(float), step="mid", alpha=0.25, color="C3")
+    ax2.set_ylabel(f"{fault.type} sensor mask on {fault.target}", color="C3")
     ax2.set_ylim(-0.05, 1.4)
     ax2.tick_params(axis="y", labelcolor="C3")
-    ax1.set_title(
-        "Cumulative leak + bias on Net3: leak_demand vs sensor-fault mask"
-    )
+    ax1.set_title("Cumulative leak + bias on Net3: leak_demand vs sensor-fault mask")
     return _save(fig, "cumulative_demand_and_mask_net3.png")
 
 
@@ -266,9 +250,7 @@ def _plot_cumulative_residual_jilin() -> Path:
     # Compare on the columns present in both (the cumulative run adds
     # leak-node columns; the dropout corrupts pressure with NaN, so use
     # the clean signal for a meaningful residual).
-    common = [
-        c for c in baseline.pressure.columns if c in cumulative.pressure_clean.columns
-    ]
+    common = [c for c in baseline.pressure.columns if c in cumulative.pressure_clean.columns]
     base = baseline.pressure[common].to_numpy()
     cumul = cumulative.pressure_clean[common].to_numpy()
     residual = (base - cumul).T
@@ -287,9 +269,7 @@ def _plot_cumulative_residual_jilin() -> Path:
     fig.colorbar(im, ax=ax, label="pressure residual [m]")
     ax.set_xlabel("time [h]")
     ax.set_ylabel("node index")
-    ax.set_title(
-        "Jilin: normal PDD baseline minus cumulative two-leak + dropout"
-    )
+    ax.set_title("Jilin: normal PDD baseline minus cumulative two-leak + dropout")
     return _save(fig, "cumulative_residual_jilin.png")
 
 
@@ -309,32 +289,19 @@ def _write_validation_summary() -> Path:
     for cfg_name in all_configs:
         cfg = load_config(CONFIGS / f"{cfg_name}.yaml")
         cfg = cfg.model_copy(
-            update={
-                "output": cfg.output.model_copy(
-                    update={"directory": REPO / "outputs"}
-                )
-            }
+            update={"output": cfg.output.model_copy(update={"directory": REPO / "outputs"})}
         )
         summary = run(cfg)
         lines.append(f"=== {cfg_name} ===")
         lines.append(f"  network         : {summary.network_name}")
         lines.append(f"  scenario_label  : {summary.scenario_label}")
-        lines.append(
-            f"  severity        : {summary.validation.severity.upper()}"
-        )
+        lines.append(f"  severity        : {summary.validation.severity.upper()}")
         if summary.resolved_leaks:
-            lines.append(
-                f"  resolved_leaks  : {len(summary.resolved_leaks)}"
-            )
+            lines.append(f"  resolved_leaks  : {len(summary.resolved_leaks)}")
         if summary.resolved_sensor_faults:
-            lines.append(
-                f"  resolved_sensors: {len(summary.resolved_sensor_faults)}"
-            )
+            lines.append(f"  resolved_sensors: {len(summary.resolved_sensor_faults)}")
         if summary.interactions:
-            lines.append(
-                f"  interactions    : {len(summary.interactions)} "
-                "(informational)"
-            )
+            lines.append(f"  interactions    : {len(summary.interactions)} (informational)")
         for c in summary.validation.checks:
             lines.append(_format_check(c.name, c.severity, c.detail))
         lines.append("")

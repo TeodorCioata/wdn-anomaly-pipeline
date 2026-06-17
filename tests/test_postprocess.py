@@ -1,4 +1,4 @@
-"""Tests for the leak-node cleanup post-processing step (Week 5, D28).
+"""Tests for the leak-node cleanup post-processing step (Week 5).
 
 Covers:
 
@@ -50,18 +50,10 @@ def _resolved_leak(
 
 def _synthetic_tables() -> dict[str, pd.DataFrame]:
     idx = pd.Index([0, 3600, 7200], name="time_seconds")
-    pressure = pd.DataFrame(
-        {"J1": 1.0, "J2": 2.0, "leak_0_P1": 9.0, "label": 0}, index=idx
-    )
-    demand = pd.DataFrame(
-        {"J1": 0.1, "J2": 0.2, "leak_0_P1": 0.0, "label": 0}, index=idx
-    )
-    flowrate = pd.DataFrame(
-        {"P1": 0.5, "pipe_0_P1_B": 0.4, "P2": 0.3, "label": 0}, index=idx
-    )
-    leak_demand = pd.DataFrame(
-        {"J1": 0.0, "J2": 0.0, "leak_0_P1": 0.05}, index=idx
-    )
+    pressure = pd.DataFrame({"J1": 1.0, "J2": 2.0, "leak_0_P1": 9.0, "label": 0}, index=idx)
+    demand = pd.DataFrame({"J1": 0.1, "J2": 0.2, "leak_0_P1": 0.0, "label": 0}, index=idx)
+    flowrate = pd.DataFrame({"P1": 0.5, "pipe_0_P1_B": 0.4, "P2": 0.3, "label": 0}, index=idx)
+    leak_demand = pd.DataFrame({"J1": 0.0, "J2": 0.0, "leak_0_P1": 0.05}, index=idx)
     return {
         "pressure": pressure,
         "flowrate": flowrate,
@@ -136,9 +128,7 @@ def test_remove_leak_artifacts_keeps_unrelated_columns() -> None:
 
 
 def _leak_config(tmp_path: Path, remove_leak_nodes: bool) -> PipelineConfig:
-    raw = yaml.safe_load(
-        (REPO_ROOT / "configs" / "leak_abrupt_net3.yaml").read_text()
-    )
+    raw = yaml.safe_load((REPO_ROOT / "configs" / "leak_abrupt_net3.yaml").read_text())
     raw["output"]["directory"] = str(tmp_path / "outputs")
     raw["output"]["remove_leak_nodes"] = remove_leak_nodes
     raw["output"]["formats"] = ["parquet"]
@@ -153,12 +143,8 @@ def _columns(path: Path) -> set[str]:
 def test_cleanup_disabled_keeps_leak_artifacts(tmp_path: Path) -> None:
     summary = run(_leak_config(tmp_path, remove_leak_nodes=False))
     leak = summary.resolved_leaks[0]
-    pressure_path = next(
-        p for p in summary.output_paths if p.name.endswith("pressure.parquet")
-    )
-    flow_path = next(
-        p for p in summary.output_paths if p.name.endswith("flowrate.parquet")
-    )
+    pressure_path = next(p for p in summary.output_paths if p.name.endswith("pressure.parquet"))
+    flow_path = next(p for p in summary.output_paths if p.name.endswith("flowrate.parquet"))
     assert leak.leak_node_name in _columns(pressure_path)
     assert leak.new_pipe_name in _columns(flow_path)
 
@@ -166,12 +152,8 @@ def test_cleanup_disabled_keeps_leak_artifacts(tmp_path: Path) -> None:
 def test_cleanup_enabled_matches_original_topology(tmp_path: Path) -> None:
     summary = run(_leak_config(tmp_path, remove_leak_nodes=True))
     wn = wntr.network.WaterNetworkModel("Net3")
-    pressure_path = next(
-        p for p in summary.output_paths if p.name.endswith("pressure.parquet")
-    )
-    flow_path = next(
-        p for p in summary.output_paths if p.name.endswith("flowrate.parquet")
-    )
+    pressure_path = next(p for p in summary.output_paths if p.name.endswith("pressure.parquet"))
+    flow_path = next(p for p in summary.output_paths if p.name.endswith("flowrate.parquet"))
     assert _columns(pressure_path) == set(wn.node_name_list)
     assert _columns(flow_path) == set(wn.link_name_list)
 
@@ -180,18 +162,14 @@ def test_cleanup_enabled_leak_demand_still_has_leak_node(tmp_path: Path) -> None
     summary = run(_leak_config(tmp_path, remove_leak_nodes=True))
     leak = summary.resolved_leaks[0]
     leak_demand_path = next(
-        p
-        for p in summary.output_paths
-        if p.name.endswith("leak_demand.parquet")
+        p for p in summary.output_paths if p.name.endswith("leak_demand.parquet")
     )
     assert leak.leak_node_name in _columns(leak_demand_path)
 
 
 def test_cleanup_enabled_preserves_labels(tmp_path: Path) -> None:
     summary = run(_leak_config(tmp_path, remove_leak_nodes=True))
-    pressure_path = next(
-        p for p in summary.output_paths if p.name.endswith("pressure.parquet")
-    )
+    pressure_path = next(p for p in summary.output_paths if p.name.endswith("pressure.parquet"))
     df = pq.read_table(pressure_path).to_pandas().set_index("time_seconds")
     assert "label" in df.columns
     expected = ((df.index >= 21600) & (df.index < 64800)).astype(int)
@@ -201,15 +179,11 @@ def test_cleanup_enabled_preserves_labels(tmp_path: Path) -> None:
 def test_cleanup_noop_on_normal_scenario(tmp_path: Path) -> None:
     """remove_leak_nodes on a no-leak scenario leaves the schema intact."""
 
-    raw = yaml.safe_load(
-        (REPO_ROOT / "configs" / "normal_net3_pdd.yaml").read_text()
-    )
+    raw = yaml.safe_load((REPO_ROOT / "configs" / "normal_net3_pdd.yaml").read_text())
     raw["output"]["directory"] = str(tmp_path / "outputs")
     raw["output"]["remove_leak_nodes"] = True
     raw["output"]["formats"] = ["parquet"]
     summary = run(PipelineConfig.model_validate(raw))
     wn = wntr.network.WaterNetworkModel("Net3")
-    pressure_path = next(
-        p for p in summary.output_paths if p.name.endswith("pressure.parquet")
-    )
+    pressure_path = next(p for p in summary.output_paths if p.name.endswith("pressure.parquet"))
     assert _columns(pressure_path) == set(wn.node_name_list)

@@ -167,17 +167,14 @@ def plot_leak_pressure_drop_net3(net3_leak: ScenarioRun) -> Path:
 
     leak = net3_leak.summary.resolved_leaks[0]
     leak_results = net3_leak.results
-    baseline_cfg_override = net3_leak.config.simulation.model_copy(
-        update={"demand_model": "DDA"}
-    )
+    baseline_cfg_override = net3_leak.config.simulation.model_copy(update={"demand_model": "DDA"})
     baseline_results = _normal_simulate_for_baseline(net3_leak.config, baseline_cfg_override)
 
     pressure_leak = leak_results.pressure
     nearby = ["10", "20", "40", "50"]
     nearby = [n for n in nearby if n in pressure_leak.columns][:3]
 
-    fig, axes = plt.subplots(len(nearby) + 1, 1, figsize=(10, 2.5 * (len(nearby) + 1)),
-                             sharex=True)
+    fig, axes = plt.subplots(len(nearby) + 1, 1, figsize=(10, 2.5 * (len(nearby) + 1)), sharex=True)
     if len(nearby) + 1 == 1:
         axes = [axes]
 
@@ -190,10 +187,18 @@ def plot_leak_pressure_drop_net3(net3_leak: ScenarioRun) -> Path:
     )
     axes[0].set_ylabel("Pressure (m)")
     axes[0].set_title(f"Leak node pressure — Net3 abrupt leak on pipe {leak.pipe}")
-    axes[0].axvline(leak.start_time_seconds / 3600, color="black", linestyle="--",
-                    label=f"onset t={leak.start_time_seconds // 3600}h")
-    axes[0].axvline(leak.end_time_seconds / 3600, color="black", linestyle=":",
-                    label=f"end t={leak.end_time_seconds // 3600}h")
+    axes[0].axvline(
+        leak.start_time_seconds / 3600,
+        color="black",
+        linestyle="--",
+        label=f"onset t={leak.start_time_seconds // 3600}h",
+    )
+    axes[0].axvline(
+        leak.end_time_seconds / 3600,
+        color="black",
+        linestyle=":",
+        label=f"end t={leak.end_time_seconds // 3600}h",
+    )
     axes[0].legend(loc="best", fontsize=8)
     axes[0].grid(True, alpha=0.3)
 
@@ -247,9 +252,7 @@ def plot_leak_incipient_profile_hanoi(hanoi_leak: ScenarioRun) -> Path:
     ax.axvline(leak.end_time_seconds / 3600, color="black", linestyle=":", label="end")
     ax.set_xlabel("Time (hours)")
     ax.set_ylabel("Leak demand (m^3/s)")
-    ax.set_title(
-        f"Incipient (linear) leak — Hanoi pipe {leak.pipe}, {leak.profile_steps} steps"
-    )
+    ax.set_title(f"Incipient (linear) leak — Hanoi pipe {leak.pipe}, {leak.profile_steps} steps")
     ax.legend(loc="best", fontsize=8)
     ax.grid(True, alpha=0.3)
     return _save(fig, "leak_incipient_profile_hanoi.png")
@@ -280,8 +283,9 @@ def plot_leak_pressure_heatmap_jilin(jilin_leak: ScenarioRun) -> Path:
     ax.set_ylabel("Node")
     ax.set_title("Multi-leak Jilin pressure heatmap")
     for i, t in enumerate(onsets):
-        ax.axvline(t / 3600, color="white", linestyle="--",
-                   label=f"leak {i} onset" if i < 3 else None)
+        ax.axvline(
+            t / 3600, color="white", linestyle="--", label=f"leak {i} onset" if i < 3 else None
+        )
     if onsets:
         ax.legend(loc="upper right", fontsize=8)
     return _save(fig, "leak_pressure_heatmap_jilin.png")
@@ -339,10 +343,12 @@ def plot_leak_residual_heatmap_net3(net3_leak: ScenarioRun) -> Path:
     ax.set_ylabel("Node")
     ax.set_title("Pressure residual (baseline - leak) — Net3 abrupt leak")
     for leak in net3_leak.summary.resolved_leaks:
-        ax.axvline(leak.start_time_seconds / 3600, color="black", linestyle="--",
-                   alpha=0.6, label="onset")
-        ax.axvline(leak.end_time_seconds / 3600, color="black", linestyle=":",
-                   alpha=0.6, label="end")
+        ax.axvline(
+            leak.start_time_seconds / 3600, color="black", linestyle="--", alpha=0.6, label="onset"
+        )
+        ax.axvline(
+            leak.end_time_seconds / 3600, color="black", linestyle=":", alpha=0.6, label="end"
+        )
     return _save(fig, "leak_residual_net3.png")
 
 
@@ -361,10 +367,18 @@ def plot_leak_residual_timeseries_net3(net3_leak: ScenarioRun) -> Path:
     fig, ax = plt.subplots(figsize=(10, 5))
     for node in nearby:
         ax.plot(residual.index / 3600, residual[node], label=node)
-    ax.axvline(leak.start_time_seconds / 3600, color="black", linestyle="--",
-               label=f"onset (t={leak.start_time_seconds // 3600}h)")
-    ax.axvline(leak.end_time_seconds / 3600, color="black", linestyle=":",
-               label=f"end (t={leak.end_time_seconds // 3600}h)")
+    ax.axvline(
+        leak.start_time_seconds / 3600,
+        color="black",
+        linestyle="--",
+        label=f"onset (t={leak.start_time_seconds // 3600}h)",
+    )
+    ax.axvline(
+        leak.end_time_seconds / 3600,
+        color="black",
+        linestyle=":",
+        label=f"end (t={leak.end_time_seconds // 3600}h)",
+    )
     ax.set_xlabel("Time (hours)")
     ax.set_ylabel("baseline - leak pressure (m)")
     ax.set_title("Pressure residual time-series at nearby nodes — Net3")
@@ -432,9 +446,7 @@ def write_validation_summary(scenarios: dict[str, ScenarioRun]) -> Path:
             lines.append(f"    [{check.severity:>7}] {check.name}: {check.detail}")
         # Surface key metrics for the report.
         p = sc.results.pressure.to_numpy()
-        lines.append(
-            f"  pressure_range: [{float(np.nanmin(p)):.3f}, {float(np.nanmax(p)):.3f}] m"
-        )
+        lines.append(f"  pressure_range: [{float(np.nanmin(p)):.3f}, {float(np.nanmax(p)):.3f}] m")
         lines.append("")
     target.write_text("\n".join(lines))
     return target

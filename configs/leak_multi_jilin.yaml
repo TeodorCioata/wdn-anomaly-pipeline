@@ -1,5 +1,5 @@
 # Two concurrent leaks on Jilin: one abrupt, one incipient (linear).
-# Demonstrates D15 (multiple leaks per scenario) and shows that the
+# Demonstrates multiple leaks per scenario and shows that the
 # label window covers the union of both leak time windows.
 
 network:

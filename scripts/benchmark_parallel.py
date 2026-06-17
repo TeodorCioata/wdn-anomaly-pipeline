@@ -1,4 +1,4 @@
-"""Parallelisation benchmark for the batch driver (Phase 5 Week 8, WP4).
+"""Parallelisation benchmark for the batch driver (Phase 5 Week 8).
 
 Runs a fixed, stratified subset of the scale configs at several worker
 counts and records wall-clock, speedup vs one worker and parallel
@@ -141,7 +141,7 @@ def parity_check(tag_a: str, tag_b: str, n_sample: int = 8) -> tuple[int, float]
         da = pq.read_table(fa).to_pandas().select_dtypes("number")
         db = pq.read_table(fb).to_pandas().select_dtypes("number")
         cols = [c for c in da.columns if c in db.columns]
-        diff = (da[cols].to_numpy() - db[cols].to_numpy())
+        diff = da[cols].to_numpy() - db[cols].to_numpy()
         max_diff = max(max_diff, float(abs(diff).max()))
         compared += 1
     return compared, max_diff
@@ -193,12 +193,12 @@ def write_doc(
         type_counts[_scenario_type(p)] = type_counts.get(_scenario_type(p), 0) + 1
 
     lines: list[str] = []
-    lines.append("# Parallelisation Benchmark (Phase 5 Week 8, WP4)\n")
+    lines.append("# Parallelisation Benchmark (Phase 5 Week 8)\n")
     lines.append(
         "Wall-clock of the batch driver running a fixed, stratified subset "
         f"of {len(subset)} scale scenarios at increasing worker counts. The "
         "batch driver uses `concurrent.futures.ProcessPoolExecutor` with the "
-        "`spawn` start method (decision D31). One warm-up run precedes the "
+        "`spawn` start method. One warm-up run precedes the "
         "timed runs.\n"
     )
     lines.append("## Machine\n")
@@ -263,7 +263,7 @@ def main() -> None:
     for w in worker_counts:
         t = time_run(subset, workers=w, tag=f"w{w}")
         times.append(t)
-        print(f"workers={w}: {t:.2f}s  speedup={times[0]/t:.2f}x")
+        print(f"workers={w}: {t:.2f}s  speedup={times[0] / t:.2f}x")
 
     # Parity between the 1-worker run and the highest worker count.
     hi = max(worker_counts)

@@ -1,12 +1,12 @@
 # Calibrated normal scenario on Net3 (24h, 1h timestep).
 #
-# Demonstrates the Week 8 hydraulic calibration options (decision D33).
+# Demonstrates the Week 8 hydraulic calibration options.
 # Every calibration field is optional; omitting one leaves the .inp
 # value untouched. Overrides are logged in the run summary (run with
 # --verbose) and recorded under `calibration_overrides` in the metadata
 # sidecar for provenance.
 #
-# Note (D34): the pipeline always uses WNTRSimulator, which only
+# Note: the pipeline always uses WNTRSimulator, which only
 # implements Hazen-Williams headloss. `headloss: D-W`/`C-M` and a real
 # `viscosity` effect would require the EpanetSimulator (no leak support)
 # and are rejected. The options below all demonstrably change

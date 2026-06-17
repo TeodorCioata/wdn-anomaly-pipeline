@@ -2,7 +2,7 @@
 # Junction "15"'s reported pressure is multiplied by 1.10 (a +10% gain)
 # between 06:00 and 18:00. The hydraulic simulation is untouched; only
 # the reported sensor reading is corrupted. A 10% gain is well above
-# the D27 detectability floor (5%), so the signal_applied check stays
+# the detectability floor (5%), so the signal_applied check stays
 # ok rather than warning.
 
 network:

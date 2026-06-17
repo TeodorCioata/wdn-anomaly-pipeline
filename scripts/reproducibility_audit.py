@@ -77,9 +77,7 @@ def _load_parquet(path: Path) -> pd.DataFrame:
     return df
 
 
-def _compare_dirs(
-    dir_a: Path, dir_b: Path
-) -> tuple[float, str]:
+def _compare_dirs(dir_a: Path, dir_b: Path) -> tuple[float, str]:
     """Return (max_abs_residual, detail string) across the diff tables."""
 
     worst: float = 0.0
@@ -141,9 +139,7 @@ def _compare_dirs(
     return worst, detail
 
 
-def audit(
-    configs_dir: Path, output_dir: Path, glob_pattern: str = "*.yaml"
-) -> int:
+def audit(configs_dir: Path, output_dir: Path, glob_pattern: str = "*.yaml") -> int:
     """Run the audit across every matching config. Returns process exit code."""
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -182,9 +178,7 @@ def audit(
                 n_pass += 1
             else:
                 n_fail += 1
-            lines.append(
-                f"{status:>5} {name:<40s} elapsed={elapsed:5.1f}s {detail}"
-            )
+            lines.append(f"{status:>5} {name:<40s} elapsed={elapsed:5.1f}s {detail}")
             print(lines[-1])
         except Exception as exc:  # noqa: BLE001 - audit isolates failures
             n_error += 1
@@ -192,9 +186,7 @@ def audit(
             print(lines[-1], file=sys.stderr)
 
     lines.append("")
-    lines.append(
-        f"Total: {n_total}, pass: {n_pass}, fail: {n_fail}, error: {n_error}"
-    )
+    lines.append(f"Total: {n_total}, pass: {n_pass}, fail: {n_fail}, error: {n_error}")
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"\nwrote {report_path}")
     return 0 if n_fail == 0 and n_error == 0 else 1

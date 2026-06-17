@@ -36,7 +36,7 @@ import numpy as np
 import pandas as pd
 from wntr.network import WaterNetworkModel
 
-from wdn_pipeline.config import ValidationConfig
+from wdn_pipeline.config import SimulationConfig, ValidationConfig, WaterQualityConfig
 from wdn_pipeline.faults.leak import ResolvedLeak
 from wdn_pipeline.faults.sensor import ResolvedSensorFault
 from wdn_pipeline.simulation import SimulationResults
@@ -92,21 +92,29 @@ class ValidationReport:
         return "\n".join(lines)
 
 
+def _nan_inf_count(df: pd.DataFrame) -> int:
+    """Count NaN plus inf entries in a numeric frame."""
+
+    return int(df.isna().sum().sum()) + int(np.isinf(df.to_numpy()).sum())
+
+
 def _check_finite(results: SimulationResults) -> ValidationCheck:
     bad = {
-        "pressure": int(results.pressure.isna().sum().sum())
-        + int(np.isinf(results.pressure.to_numpy()).sum()),
-        "flowrate": int(results.flowrate.isna().sum().sum())
-        + int(np.isinf(results.flowrate.to_numpy()).sum()),
-        "demand": int(results.demand.isna().sum().sum())
-        + int(np.isinf(results.demand.to_numpy()).sum()),
+        "pressure": _nan_inf_count(results.pressure),
+        "flowrate": _nan_inf_count(results.flowrate),
+        "demand": _nan_inf_count(results.demand),
     }
+    # The water quality table is present only on the EpanetSimulator path;
+    # check it too so a pathological quality solve (NaN concentrations) is
+    # caught rather than written out silently.
+    if results.quality is not None:
+        bad["quality"] = _nan_inf_count(results.quality)
     if sum(bad.values()) == 0:
         return ValidationCheck("finite_values", "ok", "no NaN or inf in any output")
     return ValidationCheck(
         "finite_values",
         "fail",
-        f"NaN/inf counts: pressure={bad['pressure']}, flowrate={bad['flowrate']}, demand={bad['demand']}",
+        "NaN/inf counts: " + ", ".join(f"{k}={v}" for k, v in bad.items()),
     )
 
 
@@ -123,9 +131,7 @@ def _negative_pressure_locations(
     return out
 
 
-def _check_pressure_bounds(
-    results: SimulationResults, cfg: ValidationConfig
-) -> ValidationCheck:
+def _check_pressure_bounds(results: SimulationResults, cfg: ValidationConfig) -> ValidationCheck:
     p = results.pressure.to_numpy()
     pmin = float(np.nanmin(p))
     pmax = float(np.nanmax(p))
@@ -145,9 +151,7 @@ def _check_pressure_bounds(
                 by_node[node] = (t, v)
         issues.append(
             "low-pressure nodes (worst sample): "
-            + ", ".join(
-                f"{n}@t={t}s={v:.3f}m" for n, (t, v) in sorted(by_node.items())
-            )
+            + ", ".join(f"{n}@t={t}s={v:.3f}m" for n, (t, v) in sorted(by_node.items()))
         )
     else:
         severity = "ok"
@@ -204,11 +208,7 @@ def _check_mass_balance(
     incidence, junctions, links = _build_incidence(wn)
     flows = results.flowrate.reindex(columns=links).to_numpy()
     demands = results.demand.reindex(columns=junctions).to_numpy()
-    leak = (
-        results.leak_demand.reindex(columns=junctions)
-        .fillna(0.0)
-        .to_numpy()
-    )
+    leak = results.leak_demand.reindex(columns=junctions).fillna(0.0).to_numpy()
     net_inflow = flows @ incidence.T
     residual = net_inflow - demands - leak
     max_residual = float(np.abs(residual).max())
@@ -219,6 +219,69 @@ def _check_mass_balance(
         f"max |net_inflow - demand - leak| = {max_residual:.3e} m^3/s "
         f"(tol {cfg.mass_balance_tol_m3s:.0e})",
     )
+
+
+def _check_quality_plausible(
+    results: SimulationResults, quality_cfg: WaterQualityConfig
+) -> ValidationCheck:
+    """Plausibility bounds on the water-quality table.
+
+    Vectorised bounds per analysis type (no per-node loops):
+
+    - ``chemical``: concentration ``>= 0`` (a negative concentration is
+      unphysical and fails) and, when sources are configured, not far
+      above the strongest source strength (a mild overshoot warns; CONCEN
+      mixing should never raise a node above the strongest inflow).
+    - ``trace``: percentage of flow from the trace node, must lie in
+      ``[0, 100]`` (out of band fails).
+    - ``age``: residence time in seconds, ``>= 0`` (negative fails).
+
+    A small numeric-noise tolerance is allowed before failing. Returns an
+    ``ok`` check when no quality table is present so it is safe to call on
+    any results object.
+    """
+
+    if results.quality is None:
+        return ValidationCheck("quality_plausible", "ok", "no quality table")
+    q = results.quality.to_numpy()
+    if q.size == 0:
+        return ValidationCheck("quality_plausible", "ok", "empty quality table")
+
+    qmin = float(np.nanmin(q))
+    qmax = float(np.nanmax(q))
+    param = quality_cfg.parameter
+    neg_tol = 1e-6  # absorb floating-point noise around zero
+    issues: list[str] = []
+    soft: list[str] = []
+
+    if param == "trace":
+        band = 0.01  # percent
+        if qmin < -band or qmax > 100.0 + band:
+            issues.append(f"trace outside [0, 100] %: min={qmin:.3f} max={qmax:.3f}")
+    elif param == "age":
+        if qmin < -neg_tol:
+            issues.append(f"water age negative: min={qmin:.3e} s")
+    elif param == "chemical":
+        if qmin < -neg_tol:
+            issues.append(f"chemical concentration negative: min={qmin:.3e}")
+        strengths = [s.strength for s in quality_cfg.sources]
+        if strengths:
+            max_strength = max(strengths)
+            rel_tol = 0.01
+            bound = max_strength * (1.0 + rel_tol) + 1e-9
+            if qmax > bound:
+                soft.append(
+                    f"chemical concentration {qmax:.3e} exceeds max source strength "
+                    f"{max_strength:.3e} (+{rel_tol * 100:.0f}% tol)"
+                )
+
+    severity: Severity = "fail" if issues else ("warning" if soft else "ok")
+    detail = f"parameter={param} min={qmin:.3e} max={qmax:.3e}"
+    if issues:
+        detail += " | " + "; ".join(issues)
+    if soft:
+        detail += " | " + "; ".join(soft)
+    return ValidationCheck("quality_plausible", severity, detail)
 
 
 def _check_leak_demand_active(
@@ -266,9 +329,7 @@ def _check_leak_demand_active(
             f"max|inactive|={inactive_max:.3e} m^3/s"
         )
         if active_min <= 0.0:
-            issues.append(
-                f"{leak.leak_node_name}: leak_demand <= 0 at an active timestep"
-            )
+            issues.append(f"{leak.leak_node_name}: leak_demand <= 0 at an active timestep")
         # Tight tolerance: WNTR reports exact zeros outside the
         # half-open window; anything above 1e-12 m^3/s indicates a
         # window-mismatch bug rather than numerical noise.
@@ -323,9 +384,7 @@ def _check_leak_pressure_drop(
         baseline_mask = times < leak.start_time_seconds
         leak_mask = (times >= leak.start_time_seconds) & (times < leak.end_time_seconds)
         if not baseline_mask.any() or not leak_mask.any():
-            issues.append(
-                f"{leak.leak_node_name}: insufficient samples for baseline/leak window"
-            )
+            issues.append(f"{leak.leak_node_name}: insufficient samples for baseline/leak window")
             continue
         baseline = float(col[baseline_mask].mean())
         during = float(col[leak_mask].mean())
@@ -359,9 +418,7 @@ def _check_sensor_fault_mask_consistent(
     """
 
     if not resolved_faults:
-        return ValidationCheck(
-            "sensor_fault_mask_consistent", "ok", "no sensor faults"
-        )
+        return ValidationCheck("sensor_fault_mask_consistent", "ok", "no sensor faults")
 
     time_index = results.pressure.index
     times = time_index.to_numpy()
@@ -378,22 +435,230 @@ def _check_sensor_fault_mask_consistent(
             for a, b in fault.intervals or []:
                 expected |= (times >= int(a)) & (times < int(b))
         else:
-            expected = (times >= fault.start_time_seconds) & (
-                times < fault.end_time_seconds
-            )
+            expected = (times >= fault.start_time_seconds) & (times < fault.end_time_seconds)
         if not np.array_equal(actual, expected):
             n_diff = int(np.sum(actual != expected))
-            issues.append(
-                f"{mask_col}: mask disagrees with window at {n_diff} timesteps"
-            )
+            issues.append(f"{mask_col}: mask disagrees with window at {n_diff} timesteps")
 
     severity: Severity = "fail" if issues else "ok"
-    detail = (
-        f"checked {len(resolved_faults)} fault mask(s)"
-        if not issues
-        else "; ".join(issues)
-    )
+    detail = f"checked {len(resolved_faults)} fault mask(s)" if not issues else "; ".join(issues)
     return ValidationCheck("sensor_fault_mask_consistent", severity, detail)
+
+
+# Per-type residual checks for ``_check_sensor_fault_signal_applied``.
+# Each takes the resolved fault plus the clean/corrupted channel arrays
+# (1-D, aligned with ``times``) and the in-window boolean ``active`` mask,
+# and returns ``(summary, issues, soft_issues)``. ``issues`` raise the
+# check to ``fail``; ``soft_issues`` raise it to ``warning``. The per-type
+# field each helper needs (``bias_value`` etc.) is guaranteed present by
+# the discriminated-union spec validator; the explicit ``is None`` guard
+# documents that invariant and lets the type narrow without a cast.
+_ResidualResult = tuple[str, list[str], list[str]]
+
+
+def _residual_bias(
+    fault: ResolvedSensorFault,
+    clean: np.ndarray,
+    corrupted: np.ndarray,
+    active: np.ndarray,
+    times: np.ndarray,
+    cfg: ValidationConfig,
+) -> _ResidualResult:
+    if fault.bias_value is None:
+        raise ValueError("resolved bias fault is missing bias_value")
+    inside_diff = corrupted[active] - clean[active]
+    expected = float(fault.bias_value)
+    max_err = float(np.max(np.abs(inside_diff - expected)))
+    summary = (
+        f"bias@{fault.target}: residual={inside_diff.mean():.3f} "
+        f"(expected {expected:.3f}, max_err={max_err:.3e})"
+    )
+    issues: list[str] = []
+    if max_err > 1e-9:
+        issues.append(
+            f"bias@{fault.target}: residual deviates from bias_value (max_err={max_err:.3e})"
+        )
+    return summary, issues, []
+
+
+def _residual_drift(
+    fault: ResolvedSensorFault,
+    clean: np.ndarray,
+    corrupted: np.ndarray,
+    active: np.ndarray,
+    times: np.ndarray,
+    cfg: ValidationConfig,
+) -> _ResidualResult:
+    if fault.slope_per_second is None:
+        raise ValueError("resolved drift fault is missing slope_per_second")
+    slope = float(fault.slope_per_second)
+    dt = times[active] - fault.start_time_seconds
+    expected_curve = slope * dt
+    inside_diff = corrupted[active] - clean[active]
+    max_err = float(np.max(np.abs(inside_diff - expected_curve)))
+    summary = (
+        f"drift@{fault.target}: slope={slope:.3e}/s n_active={int(active.sum())} "
+        f"max_err={max_err:.3e}"
+    )
+    issues: list[str] = []
+    if max_err > 1e-9:
+        issues.append(
+            f"drift@{fault.target}: residual deviates from slope * dt (max_err={max_err:.3e})"
+        )
+    return summary, issues, []
+
+
+def _residual_stuck(
+    fault: ResolvedSensorFault,
+    clean: np.ndarray,
+    corrupted: np.ndarray,
+    active: np.ndarray,
+    times: np.ndarray,
+    cfg: ValidationConfig,
+) -> _ResidualResult:
+    active_idx = np.where(active)[0]
+    if active_idx.size == 0:
+        return f"stuck@{fault.target}: no active samples", [], []
+    stuck_value = float(clean[active_idx[0]])
+    inside_vals = corrupted[active]
+    max_err = float(np.max(np.abs(inside_vals - stuck_value)))
+    summary = f"stuck@{fault.target}: stuck_value={stuck_value:.3f} max_err={max_err:.3e}"
+    issues: list[str] = []
+    if max_err > 1e-9:
+        issues.append(
+            f"stuck@{fault.target}: corrupted differs from y(start) (max_err={max_err:.3e})"
+        )
+    return summary, issues, []
+
+
+def _residual_dropout(
+    fault: ResolvedSensorFault,
+    clean: np.ndarray,
+    corrupted: np.ndarray,
+    active: np.ndarray,
+    times: np.ndarray,
+    cfg: ValidationConfig,
+) -> _ResidualResult:
+    # Dropout corrupts the sub-intervals, not the whole outer window.
+    sub_active = np.zeros_like(times, dtype=bool)
+    for a, b in fault.intervals or []:
+        sub_active |= (times >= int(a)) & (times < int(b))
+    inside_vals = corrupted[sub_active]
+    if fault.fill_value is None:
+        summary = f"dropout@{fault.target}: NaN-filled {int(sub_active.sum())} sample(s)"
+        issues: list[str] = []
+        if not bool(np.all(np.isnan(inside_vals))):
+            issues.append(f"dropout@{fault.target}: not all dropout samples are NaN")
+        return summary, issues, []
+    fill = float(fault.fill_value)
+    max_err = float(np.max(np.abs(inside_vals - fill))) if inside_vals.size else 0.0
+    summary = f"dropout@{fault.target}: fill={fill:.3f} max_err={max_err:.3e}"
+    issues = []
+    if max_err > 1e-9:
+        issues.append(
+            f"dropout@{fault.target}: corrupted differs from fill_value (max_err={max_err:.3e})"
+        )
+    return summary, issues, []
+
+
+def _residual_noise(
+    fault: ResolvedSensorFault,
+    clean: np.ndarray,
+    corrupted: np.ndarray,
+    active: np.ndarray,
+    times: np.ndarray,
+    cfg: ValidationConfig,
+) -> _ResidualResult:
+    if fault.sigma is None:
+        raise ValueError("resolved noise fault is missing sigma")
+    sigma = float(fault.sigma)
+    inside_diff = corrupted[active] - clean[active]
+    n = inside_diff.size
+    if n == 0:
+        return f"noise@{fault.target}: no active samples", [], []
+    mean = float(np.mean(inside_diff))
+    std = float(np.std(inside_diff, ddof=0))
+    # Statistical tolerances: ~99.99% CI for the sample mean and the
+    # sample std of a Gaussian.
+    #
+    # - mean: standard error is sigma/sqrt(n); scale by 4 (~4-sigma).
+    # - std: standard error of the sample std is approximately
+    #   sigma/sqrt(2*(n-1)); scale by 4 (~4-sigma).
+    #
+    # The std band is floored at 0.30 * sigma so the tolerance never widens
+    # further than the legacy "30% relative" cap once n is large; for small
+    # n (Net3's 24-hour grid, n=24) the n-aware term dominates and removes
+    # the need to cherry-pick ``rng_offset`` values to land inside tolerance.
+    mean_tol = max(4.0 * sigma / max(1.0, n**0.5), 1e-9)
+    std_se_tol = 4.0 * sigma / max(1.0, (2.0 * max(1, n - 1)) ** 0.5)
+    std_tol = max(0.30 * sigma, std_se_tol, 1e-9)
+    summary = f"noise@{fault.target}: n={n} mean={mean:.3e} std={std:.3f} (sigma={sigma:.3f})"
+    issues: list[str] = []
+    if abs(mean) > mean_tol:
+        issues.append(
+            f"noise@{fault.target}: residual mean {mean:.3e} exceeds tolerance {mean_tol:.3e}"
+        )
+    if abs(std - sigma) > std_tol:
+        issues.append(
+            f"noise@{fault.target}: residual std {std:.3f} deviates from "
+            f"sigma {sigma:.3f} by more than {std_tol:.3f}"
+        )
+    return summary, issues, []
+
+
+def _residual_gain(
+    fault: ResolvedSensorFault,
+    clean: np.ndarray,
+    corrupted: np.ndarray,
+    active: np.ndarray,
+    times: np.ndarray,
+    cfg: ValidationConfig,
+) -> _ResidualResult:
+    if fault.gain_factor is None:
+        raise ValueError("resolved gain fault is missing gain_factor")
+    gain = float(fault.gain_factor)
+    inside_clean = clean[active]
+    inside_corrupted = corrupted[active]
+    expected = gain * inside_clean
+    max_err = float(np.max(np.abs(inside_corrupted - expected))) if inside_clean.size else 0.0
+    issues: list[str] = []
+    # Structural check: corrupted == gain_factor * clean exactly.
+    if max_err > 1e-9:
+        issues.append(
+            f"gain@{fault.target}: residual deviates from gain_factor * clean "
+            f"(max_err={max_err:.3e})"
+        )
+    # Detectability check: the residual std must be a large enough fraction
+    # of the clean-signal std. For a pure gain the residual is
+    # (gain - 1) * clean, so this ratio collapses to |gain - 1|; phrasing it
+    # as a std ratio keeps the check robust if the gain strategy is ever
+    # generalised.
+    residual = inside_corrupted - inside_clean
+    clean_std = float(np.std(inside_clean, ddof=0)) if inside_clean.size > 1 else 0.0
+    res_std = float(np.std(residual, ddof=0)) if residual.size > 1 else 0.0
+    ratio = res_std / clean_std if clean_std > 1e-12 else float("inf")
+    summary = (
+        f"gain@{fault.target}: factor={gain:.4f} n_active={int(active.sum())} "
+        f"max_err={max_err:.3e} detectability_ratio={ratio:.3f}"
+    )
+    soft_issues: list[str] = []
+    if ratio < cfg.gain_detectability_min_ratio:
+        soft_issues.append(
+            f"gain@{fault.target} may be undetectable: residual std is "
+            f"{ratio * 100:.2f}% of clean signal std "
+            f"(min {cfg.gain_detectability_min_ratio * 100:.2f}%)"
+        )
+    return summary, issues, soft_issues
+
+
+_RESIDUAL_CHECKS = {
+    "bias": _residual_bias,
+    "drift": _residual_drift,
+    "stuck": _residual_stuck,
+    "dropout": _residual_dropout,
+    "noise": _residual_noise,
+    "gain": _residual_gain,
+}
 
 
 def _check_sensor_fault_signal_applied(
@@ -405,23 +670,25 @@ def _check_sensor_fault_signal_applied(
 
     Bias / drift / stuck / dropout / gain are exact comparisons (up to
     floating-point tolerance). Noise is validated statistically: the
-    residual must have near-zero mean (within ``4*sigma/sqrt(n)``) and
-    its sample std must be near sigma (relative tolerance 30% to absorb
-    small samples, default for Net3's 24-hour 1-hour-step grid).
+    residual must have near-zero mean (within ``4*sigma/sqrt(n)``) and its
+    sample std must be near sigma (n-aware band, floored at 30%).
 
-    The gain fault adds a non-structural detectability check (D27): if
-    the residual standard deviation is below
-    ``cfg.gain_detectability_min_ratio`` times the clean-signal standard
-    deviation the fault may be statistically indistinguishable from
-    sensor noise. That emits a **warning** (never a hard failure), so
-    this check's overall severity is ``fail`` on any structural issue,
-    ``warning`` on a detectability concern and ``ok`` otherwise.
+    The gain fault adds a non-structural detectability check: if the
+    residual standard deviation is below ``cfg.gain_detectability_min_ratio``
+    times the clean-signal standard deviation the fault may be
+    statistically indistinguishable from sensor noise. That emits a
+    **warning** (never a hard failure), so this check's overall severity is
+    ``fail`` on any structural issue, ``warning`` on a detectability concern
+    and ``ok`` otherwise.
+
+    The per-type residual logic lives in the ``_residual_*`` helpers
+    dispatched through :data:`_RESIDUAL_CHECKS`; this function handles the
+    shared work (channel selection, target presence and the
+    outside-the-window match) and aggregates severities.
     """
 
     if not resolved_faults:
-        return ValidationCheck(
-            "sensor_fault_signal_applied", "ok", "no sensor faults"
-        )
+        return ValidationCheck("sensor_fault_signal_applied", "ok", "no sensor faults")
 
     issues: list[str] = []
     soft_issues: list[str] = []
@@ -435,17 +702,13 @@ def _check_sensor_fault_signal_applied(
             corrupted_df = results.flowrate
 
         if fault.target not in corrupted_df.columns:
-            issues.append(
-                f"{fault.type}@{fault.target}: target missing from corrupted frame"
-            )
+            issues.append(f"{fault.type}@{fault.target}: target missing from corrupted frame")
             continue
 
         clean = clean_df[fault.target].to_numpy(dtype=float)
         corrupted = corrupted_df[fault.target].to_numpy(dtype=float)
         times = corrupted_df.index.to_numpy()
-        active = (times >= fault.start_time_seconds) & (
-            times < fault.end_time_seconds
-        )
+        active = (times >= fault.start_time_seconds) & (times < fault.end_time_seconds)
         inactive = ~active
 
         # Outside the fault window the two must match bit-for-bit
@@ -463,167 +726,18 @@ def _check_sensor_fault_signal_applied(
                     f"outside fault window (max |diff| = {outside_diff:.3e})"
                 )
 
-        if fault.type == "bias":
-            inside_diff = corrupted[active] - clean[active]
-            expected = float(fault.bias_value)  # type: ignore[arg-type]
-            max_err = float(np.max(np.abs(inside_diff - expected)))
-            summaries.append(
-                f"bias@{fault.target}: residual={inside_diff.mean():.3f} "
-                f"(expected {expected:.3f}, max_err={max_err:.3e})"
-            )
-            if max_err > 1e-9:
-                issues.append(
-                    f"bias@{fault.target}: residual deviates from bias_value "
-                    f"(max_err={max_err:.3e})"
-                )
-        elif fault.type == "drift":
-            slope = float(fault.slope_per_second)  # type: ignore[arg-type]
-            dt = times[active] - fault.start_time_seconds
-            expected_curve = slope * dt
-            inside_diff = corrupted[active] - clean[active]
-            max_err = float(np.max(np.abs(inside_diff - expected_curve)))
-            summaries.append(
-                f"drift@{fault.target}: slope={slope:.3e}/s n_active={int(active.sum())} "
-                f"max_err={max_err:.3e}"
-            )
-            if max_err > 1e-9:
-                issues.append(
-                    f"drift@{fault.target}: residual deviates from "
-                    f"slope * dt (max_err={max_err:.3e})"
-                )
-        elif fault.type == "stuck":
-            active_idx = np.where(active)[0]
-            if active_idx.size == 0:
-                summaries.append(f"stuck@{fault.target}: no active samples")
-                continue
-            stuck_value = float(clean[active_idx[0]])
-            inside_vals = corrupted[active]
-            max_err = float(np.max(np.abs(inside_vals - stuck_value)))
-            summaries.append(
-                f"stuck@{fault.target}: stuck_value={stuck_value:.3f} "
-                f"max_err={max_err:.3e}"
-            )
-            if max_err > 1e-9:
-                issues.append(
-                    f"stuck@{fault.target}: corrupted differs from "
-                    f"y(start) (max_err={max_err:.3e})"
-                )
-        elif fault.type == "dropout":
-            fill_is_nan = fault.fill_value is None
-            # Build the sub-interval mask.
-            sub_active = np.zeros_like(times, dtype=bool)
-            for a, b in fault.intervals or []:
-                sub_active |= (times >= int(a)) & (times < int(b))
-            inside_vals = corrupted[sub_active]
-            if fill_is_nan:
-                ok = bool(np.all(np.isnan(inside_vals)))
-                summaries.append(
-                    f"dropout@{fault.target}: NaN-filled {int(sub_active.sum())} sample(s)"
-                )
-                if not ok:
-                    issues.append(
-                        f"dropout@{fault.target}: not all dropout samples are NaN"
-                    )
-            else:
-                fill = float(fault.fill_value)  # type: ignore[arg-type]
-                max_err = (
-                    float(np.max(np.abs(inside_vals - fill)))
-                    if inside_vals.size
-                    else 0.0
-                )
-                summaries.append(
-                    f"dropout@{fault.target}: fill={fill:.3f} max_err={max_err:.3e}"
-                )
-                if max_err > 1e-9:
-                    issues.append(
-                        f"dropout@{fault.target}: corrupted differs from fill_value "
-                        f"(max_err={max_err:.3e})"
-                    )
-        elif fault.type == "noise":
-            sigma = float(fault.sigma)  # type: ignore[arg-type]
-            inside_diff = corrupted[active] - clean[active]
-            n = inside_diff.size
-            if n == 0:
-                summaries.append(f"noise@{fault.target}: no active samples")
-                continue
-            mean = float(np.mean(inside_diff))
-            std = float(np.std(inside_diff, ddof=0))
-            # Statistical tolerances: ~99.99% CI for the sample mean and
-            # the sample std of a Gaussian.
-            #
-            # - mean: standard error is sigma/sqrt(n); scale by 4 (~4-sigma).
-            # - std: standard error of the sample std is approximately
-            #   sigma/sqrt(2*(n-1)); scale by 4 (~4-sigma).
-            #
-            # The std band is floored at 0.30 * sigma so the tolerance never
-            # widens further than the legacy "30% relative" cap once n is
-            # large; for small n (Net3's 24-hour grid, n=24) the n-aware
-            # term dominates and removes the need to cherry-pick
-            # ``rng_offset`` values to land inside tolerance.
-            mean_tol = max(4.0 * sigma / max(1.0, n**0.5), 1e-9)
-            std_se_tol = 4.0 * sigma / max(1.0, (2.0 * max(1, n - 1)) ** 0.5)
-            std_tol = max(0.30 * sigma, std_se_tol, 1e-9)
-            summaries.append(
-                f"noise@{fault.target}: n={n} mean={mean:.3e} std={std:.3f} "
-                f"(sigma={sigma:.3f})"
-            )
-            if abs(mean) > mean_tol:
-                issues.append(
-                    f"noise@{fault.target}: residual mean {mean:.3e} exceeds tolerance "
-                    f"{mean_tol:.3e}"
-                )
-            if abs(std - sigma) > std_tol:
-                issues.append(
-                    f"noise@{fault.target}: residual std {std:.3f} deviates from "
-                    f"sigma {sigma:.3f} by more than {std_tol:.3f}"
-                )
-        elif fault.type == "gain":
-            gain = float(fault.gain_factor)  # type: ignore[arg-type]
-            inside_clean = clean[active]
-            inside_corrupted = corrupted[active]
-            expected = gain * inside_clean
-            max_err = (
-                float(np.max(np.abs(inside_corrupted - expected)))
-                if inside_clean.size
-                else 0.0
-            )
-            # Structural check: corrupted == gain_factor * clean exactly.
-            if max_err > 1e-9:
-                issues.append(
-                    f"gain@{fault.target}: residual deviates from "
-                    f"gain_factor * clean (max_err={max_err:.3e})"
-                )
-            # Detectability check (D27): the residual std must be a large
-            # enough fraction of the clean-signal std. For a pure gain
-            # the residual is (gain - 1) * clean, so this ratio collapses
-            # to |gain - 1|; phrasing it as a std ratio keeps the check
-            # robust if the gain strategy is ever generalised.
-            residual = inside_corrupted - inside_clean
-            clean_std = (
-                float(np.std(inside_clean, ddof=0))
-                if inside_clean.size > 1
-                else 0.0
-            )
-            res_std = (
-                float(np.std(residual, ddof=0)) if residual.size > 1 else 0.0
-            )
-            ratio = res_std / clean_std if clean_std > 1e-12 else float("inf")
-            summaries.append(
-                f"gain@{fault.target}: factor={gain:.4f} n_active={int(active.sum())} "
-                f"max_err={max_err:.3e} detectability_ratio={ratio:.3f}"
-            )
-            if ratio < cfg.gain_detectability_min_ratio:
-                soft_issues.append(
-                    f"gain@{fault.target} may be undetectable: residual std is "
-                    f"{ratio * 100:.2f}% of clean signal std "
-                    f"(min {cfg.gain_detectability_min_ratio * 100:.2f}%)"
-                )
-        else:
+        residual_check = _RESIDUAL_CHECKS.get(fault.type)
+        if residual_check is None:
             issues.append(f"unknown sensor fault type: {fault.type}")
+            continue
+        summary, fault_issues, fault_soft = residual_check(
+            fault, clean, corrupted, active, times, cfg
+        )
+        summaries.append(summary)
+        issues.extend(fault_issues)
+        soft_issues.extend(fault_soft)
 
-    severity: Severity = (
-        "fail" if issues else ("warning" if soft_issues else "ok")
-    )
+    severity: Severity = "fail" if issues else ("warning" if soft_issues else "ok")
     detail = "; ".join(summaries) if summaries else "no checks executed"
     if issues:
         detail += " | " + "; ".join(issues)
@@ -644,6 +758,31 @@ def validate_normal_scenario(
             _check_finite(results),
             _check_pressure_bounds(results, cfg),
             _check_mass_balance(wn, results, cfg),
+        ]
+    )
+
+
+def validate_quality_scenario(
+    wn: WaterNetworkModel,
+    results: SimulationResults,
+    simulation_cfg: SimulationConfig,
+    cfg: ValidationConfig,
+) -> ValidationReport:
+    """Run normal-scenario checks plus the water-quality plausibility check.
+
+    Used for non-leak water-quality scenarios (the EpanetSimulator path).
+    The hydraulics come from EPANET here, so the usual finite, pressure
+    and mass-balance checks run as for a normal scenario; ``quality_plausible``
+    additionally bounds-checks the ``quality`` table for the configured
+    analysis type.
+    """
+
+    return ValidationReport(
+        checks=[
+            _check_finite(results),
+            _check_pressure_bounds(results, cfg),
+            _check_mass_balance(wn, results, cfg),
+            _check_quality_plausible(results, simulation_cfg.quality),
         ]
     )
 
@@ -717,8 +856,7 @@ def validate_sensor_fault_scenario(
         finite_check = ValidationCheck(
             name=finite_check.name,
             severity=finite_check.severity,
-            detail="(clean signals only; dropout NaNs are expected) "
-            + finite_check.detail,
+            detail="(clean signals only; dropout NaNs are expected) " + finite_check.detail,
         )
         bounds_check = _check_pressure_bounds(clean_results, cfg)
     else:
@@ -730,12 +868,8 @@ def validate_sensor_fault_scenario(
             finite_check,
             bounds_check,
             mass_check,
-            _check_sensor_fault_mask_consistent(
-                results, resolved_sensor_faults, masks
-            ),
-            _check_sensor_fault_signal_applied(
-                results, resolved_sensor_faults, cfg
-            ),
+            _check_sensor_fault_mask_consistent(results, resolved_sensor_faults, masks),
+            _check_sensor_fault_signal_applied(results, resolved_sensor_faults, cfg),
         ]
     )
 
@@ -783,8 +917,7 @@ def validate_cumulative_scenario(
         finite_check = ValidationCheck(
             name=finite_check.name,
             severity=finite_check.severity,
-            detail="(clean signals only; dropout NaNs are expected) "
-            + finite_check.detail,
+            detail="(clean signals only; dropout NaNs are expected) " + finite_check.detail,
         )
         bounds_check = _check_pressure_bounds(clean_results, cfg)
     else:
@@ -798,12 +931,8 @@ def validate_cumulative_scenario(
             _check_mass_balance(wn, clean_results, cfg),
             _check_leak_demand_active(clean_results, resolved_leaks),
             _check_leak_pressure_drop(clean_results, resolved_leaks, cfg),
-            _check_sensor_fault_mask_consistent(
-                results, resolved_sensor_faults, masks
-            ),
-            _check_sensor_fault_signal_applied(
-                results, resolved_sensor_faults, cfg
-            ),
+            _check_sensor_fault_mask_consistent(results, resolved_sensor_faults, masks),
+            _check_sensor_fault_signal_applied(results, resolved_sensor_faults, cfg),
         ]
     )
 

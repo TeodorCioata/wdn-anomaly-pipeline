@@ -80,9 +80,7 @@ def _run_sensor_scenario(config_name: str) -> SensorRun:
     if cfg.faults.leaks:
         LeakInjector().apply(wn, list(cfg.faults.leaks), rng)
     results = run_simulation(wn)
-    sf = SensorFaultInjector().apply(
-        results, list(cfg.faults.sensor_faults), rng, wn
-    )
+    sf = SensorFaultInjector().apply(results, list(cfg.faults.sensor_faults), rng, wn)
     fault = sf.resolved[0]
     return SensorRun(
         label=cfg.scenario.label,
@@ -150,9 +148,7 @@ def _summary_lines(label: str, summary) -> list[str]:
     if summary.resolved_leaks:
         lines.append(f"  resolved_leaks  : {len(summary.resolved_leaks)}")
     if summary.resolved_sensor_faults:
-        lines.append(
-            f"  resolved_sensors: {len(summary.resolved_sensor_faults)}"
-        )
+        lines.append(f"  resolved_sensors: {len(summary.resolved_sensor_faults)}")
         for f in summary.resolved_sensor_faults:
             lines.append(
                 f"    - type={f.type} quantity={f.quantity} target={f.target} "
@@ -176,9 +172,7 @@ def main() -> None:
     for cfg_name in sensor_configs:
         run_ = _run_sensor_scenario(cfg_name)
         fault_type = run_.fault_type
-        written.append(
-            _plot_clean_vs_corrupted(run_, f"sensor_{fault_type}_net3.png")
-        )
+        written.append(_plot_clean_vs_corrupted(run_, f"sensor_{fault_type}_net3.png"))
         # Residual plots are most informative for bias / drift / stuck;
         # we still emit them for dropout and noise for completeness.
         written.append(
@@ -194,11 +188,7 @@ def main() -> None:
     for cfg_name in all_configs:
         cfg = load_config(CONFIGS / f"{cfg_name}.yaml")
         cfg = cfg.model_copy(
-            update={
-                "output": cfg.output.model_copy(
-                    update={"directory": REPO / "outputs"}
-                )
-            }
+            update={"output": cfg.output.model_copy(update={"directory": REPO / "outputs"})}
         )
         summary = run(cfg)
         summary_lines.extend(_summary_lines(cfg_name, summary))

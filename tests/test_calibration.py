@@ -1,4 +1,4 @@
-"""Tests for the WNTR hydraulic calibration options (D33, D34, Week 8)."""
+"""Tests for the WNTR hydraulic calibration options (Week 8)."""
 
 from __future__ import annotations
 
@@ -146,7 +146,7 @@ def test_pdd_only_option_allowed_under_pdd() -> None:
 
 def test_dw_headloss_rejected_under_wntr_simulator() -> None:
     # Config load accepts D-W (it is a valid EPANET formula); network
-    # prep rejects it because WNTRSimulator is H-W only (D34).
+    # prep rejects it because WNTRSimulator is H-W only.
     cfg = _sim_cfg(headloss="D-W")
     wn = load_network(NetworkConfig(inp_path="Net3"), cfg)
     with pytest.raises(ValueError, match="WNTRSimulator"):

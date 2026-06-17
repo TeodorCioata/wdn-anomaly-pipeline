@@ -18,7 +18,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated
 
-import click
 import numpy as np
 import pandas as pd
 import typer
@@ -35,6 +34,7 @@ from wdn_pipeline.labelling import build_labels
 from wdn_pipeline.network import (
     HydraulicOverride,
     apply_hydraulic_options,
+    apply_quality_options,
     derive_network_name,
     load_network,
 )
@@ -51,6 +51,7 @@ from wdn_pipeline.validation import (
     validate_cumulative_scenario,
     validate_leak_scenario,
     validate_normal_scenario,
+    validate_quality_scenario,
     validate_sensor_fault_scenario,
 )
 
@@ -73,6 +74,7 @@ class RunSummary:
     resolved_sensor_faults: list[ResolvedSensorFault] = field(default_factory=list)
     interactions: list[dict] = field(default_factory=list)
     option_overrides: list[HydraulicOverride] = field(default_factory=list)
+    quality_settings: dict = field(default_factory=dict)
 
     def format(self) -> str:
         lines = [
@@ -86,13 +88,20 @@ class RunSummary:
         ]
         if self.option_overrides:
             lines.append(
-                f"calibration     : {len(self.option_overrides)} hydraulic "
-                "option override(s)"
+                f"calibration     : {len(self.option_overrides)} hydraulic option override(s)"
             )
             for o in self.option_overrides:
                 lines.append(
                     f"  {o.option} : {o.inp_value!r} (.inp) -> {o.config_value!r} (config)"
                 )
+        if self.quality_settings:
+            lines.append(
+                f"water_quality   : {self.quality_settings.get('parameter')} (EpanetSimulator)"
+            )
+            for key, value in self.quality_settings.items():
+                if key == "parameter":
+                    continue
+                lines.append(f"  {key} : {value!r}")
         if self.resolved_leaks:
             lines.append(f"resolved_leaks  : {len(self.resolved_leaks)}")
             for i, leak in enumerate(self.resolved_leaks):
@@ -102,18 +111,14 @@ class RunSummary:
                     f"window=[{leak.start_time_seconds},{leak.end_time_seconds}]s"
                 )
         if self.resolved_sensor_faults:
-            lines.append(
-                f"resolved_sensors: {len(self.resolved_sensor_faults)}"
-            )
+            lines.append(f"resolved_sensors: {len(self.resolved_sensor_faults)}")
             for i, f in enumerate(self.resolved_sensor_faults):
                 lines.append(
                     f"  [{i}] type={f.type} quantity={f.quantity} target={f.target} "
                     f"window=[{f.start_time_seconds},{f.end_time_seconds})s"
                 )
         if self.interactions:
-            lines.append(
-                f"interactions    : {len(self.interactions)} (informational)"
-            )
+            lines.append(f"interactions    : {len(self.interactions)} (informational)")
             for i, it in enumerate(self.interactions):
                 lines.append(
                     f"  [{i}] {it['kind']}: sensor target {it['sensor_target']} "
@@ -153,9 +158,15 @@ def run(config: PipelineConfig, config_path: str | None = None) -> RunSummary:
             "Applied %d hydraulic calibration override(s): %s",
             len(option_overrides),
             "; ".join(
-                f"{o.option}={o.config_value!r} (was {o.inp_value!r})"
-                for o in option_overrides
+                f"{o.option}={o.config_value!r} (was {o.inp_value!r})" for o in option_overrides
             ),
+        )
+
+    quality_settings = apply_quality_options(wn, config.simulation)
+    if quality_settings:
+        logger.info(
+            "Water quality analysis enabled (EpanetSimulator): %s",
+            quality_settings.get("parameter"),
         )
 
     logger.info("Applying demand strategy: %s", config.demand.mode)
@@ -172,16 +183,18 @@ def run(config: PipelineConfig, config_path: str | None = None) -> RunSummary:
     else:
         resolved_leaks = []
 
-    logger.info("Running WNTR simulation")
-    results: SimulationResults = run_simulation(wn)
+    use_epanet = config.simulation.quality.enabled
+    logger.info(
+        "Running %s simulation",
+        "EPANET (water quality)" if use_epanet else "WNTR",
+    )
+    results: SimulationResults = run_simulation(wn, use_epanet_for_quality=use_epanet)
     logger.info("Simulation finished in %.3fs", results.elapsed_seconds)
 
     sensor_masks: dict[str, pd.Series] = {}
     resolved_sensor_faults: list[ResolvedSensorFault] = []
     if config.faults.sensor_faults:
-        logger.info(
-            "Injecting %d sensor fault(s)", len(config.faults.sensor_faults)
-        )
+        logger.info("Injecting %d sensor fault(s)", len(config.faults.sensor_faults))
         sensor_result = SensorFaultInjector().apply(
             results, list(config.faults.sensor_faults), rng, wn
         )
@@ -201,17 +214,17 @@ def run(config: PipelineConfig, config_path: str | None = None) -> RunSummary:
     # Calibration provenance: record every overridden hydraulic option
     # into the sidecar metadata so a downstream consumer can audit how a
     # scenario was calibrated.
-    labels.metadata["calibration_overrides"] = [
-        o.to_dict() for o in option_overrides
-    ]
+    labels.metadata["calibration_overrides"] = [o.to_dict() for o in option_overrides]
+    # Water quality provenance: only recorded when a quality analysis
+    # ran, so a no-quality scenario's sidecar is unchanged.
+    if quality_settings:
+        labels.metadata["water_quality"] = quality_settings
 
     interactions = labels.metadata.get("fault_summary", {}).get("interactions", [])
     if interactions:
         logger.info(
             "Cumulative interaction(s) recorded (informational): %s",
-            "; ".join(
-                f"{it['kind']} on {it['sensor_target']}" for it in interactions
-            ),
+            "; ".join(f"{it['kind']} on {it['sensor_target']}" for it in interactions),
         )
 
     logger.info("Validating outputs")
@@ -230,6 +243,8 @@ def run(config: PipelineConfig, config_path: str | None = None) -> RunSummary:
         )
     elif resolved_leaks:
         report = validate_leak_scenario(wn, results, resolved_leaks, config.validation)
+    elif config.simulation.quality.enabled:
+        report = validate_quality_scenario(wn, results, config.simulation, config.validation)
     else:
         report = validate_normal_scenario(wn, results, config.validation)
     logger.info("Validation severity: %s", report.severity.upper())
@@ -239,14 +254,10 @@ def run(config: PipelineConfig, config_path: str | None = None) -> RunSummary:
 
     if config.output.remove_leak_nodes:
         if resolved_leaks:
-            logger.info(
-                "Reverting leak-node split artefacts (output.remove_leak_nodes)"
-            )
+            logger.info("Reverting leak-node split artefacts (output.remove_leak_nodes)")
             tables = remove_leak_artifacts(tables, resolved_leaks)
         else:
-            logger.info(
-                "output.remove_leak_nodes set but no leaks injected; cleanup is a no-op"
-            )
+            logger.info("output.remove_leak_nodes set but no leaks injected; cleanup is a no-op")
 
     logger.info("Writing outputs to %s", config.output.directory)
     duckdb_target = config.output.duckdb_path if config.output.duckdb else None
@@ -276,6 +287,7 @@ def run(config: PipelineConfig, config_path: str | None = None) -> RunSummary:
         resolved_sensor_faults=resolved_sensor_faults,
         interactions=interactions,
         option_overrides=option_overrides,
+        quality_settings=quality_settings,
     )
 
 
@@ -299,13 +311,14 @@ class _DefaultCommandGroup(TyperGroup):
     default_command_name = "run"
 
     def resolve_command(self, ctx, args):
-        try:
-            return super().resolve_command(ctx, args)
-        except click.exceptions.UsageError:
-            if args and not args[0].startswith("-"):
-                args.insert(0, self.default_command_name)
-                return super().resolve_command(ctx, args)
-            raise
+        # If the first token is not a registered subcommand and looks like
+        # a positional argument (a config path, not an option), prepend the
+        # default `run` command. Checking command membership directly is
+        # robust across click versions, unlike catching the "no such
+        # command" UsageError, whose path changed between click 8.3 and 8.4.
+        if args and not args[0].startswith("-") and args[0] not in self.commands:
+            args = [self.default_command_name, *args]
+        return super().resolve_command(ctx, args)
 
 
 app = typer.Typer(
@@ -397,7 +410,7 @@ def cli_batch(
         typer.Option(
             "--duckdb",
             help="If set, consolidate every scenario's tables into this "
-            "DuckDB file (decision D30). Overrides any per-config "
+            "DuckDB file. Overrides any per-config "
             "output.duckdb_path. Adds a 'scenarios' metadata table.",
         ),
     ] = None,
@@ -406,7 +419,7 @@ def cli_batch(
         typer.Option(
             "--duckdb-long-only",
             help="Consolidate as long tables + scenarios catalogue only, "
-            "skipping the per-scenario wide tables (decision D35). Far "
+            "skipping the per-scenario wide tables. Far "
             "smaller and faster for large batches; the query layer slices "
             "the long tables. Whole-scenario flat export stays in Parquet/CSV.",
         ),
@@ -441,8 +454,7 @@ def cli_batch(
     )
     if not config_paths:
         raise typer.BadParameter(
-            "No config paths resolved. Provide explicit paths, a glob, "
-            "or --config-dir."
+            "No config paths resolved. Provide explicit paths, a glob, or --config-dir."
         )
 
     batch_id = _time.strftime("%Y%m%dT%H%M%S")
@@ -467,7 +479,7 @@ def cli_batch(
         raise typer.Exit(code=1)
 
 
-_VALUE_QUANTITIES = {"pressure", "flowrate", "demand", "leak_demand"}
+_VALUE_QUANTITIES = {"pressure", "flowrate", "demand", "leak_demand", "quality"}
 _QUERY_QUANTITIES = _VALUE_QUANTITIES | {"labels", "masks"}
 
 
@@ -490,7 +502,7 @@ def cli_query(
         str | None,
         typer.Option(
             "--quantity",
-            help="One of pressure / flowrate / demand / leak_demand / labels / masks.",
+            help="One of pressure / flowrate / demand / leak_demand / quality / labels / masks.",
         ),
     ] = None,
     scenario: Annotated[
@@ -543,7 +555,7 @@ def cli_query(
         int, typer.Option("--limit", help="Rows to print when --out is not given.")
     ] = 20,
 ) -> None:
-    """Slice a pipeline DuckDB file from the shell (decision D32).
+    """Slice a pipeline DuckDB file from the shell.
 
     Examples::
 
@@ -565,9 +577,7 @@ def cli_query(
             return
 
         if quantity not in _QUERY_QUANTITIES:
-            raise typer.BadParameter(
-                f"--quantity must be one of {sorted(_QUERY_QUANTITIES)}"
-            )
+            raise typer.BadParameter(f"--quantity must be one of {sorted(_QUERY_QUANTITIES)}")
 
         # Resolve a scenario class to its scenario set via the catalogue.
         scen_list: list[str] | None = None
@@ -576,17 +586,18 @@ def cli_query(
             scen_list = list(cat["scenario_basename"])
 
         if quantity in _VALUE_QUANTITIES:
-            kwargs = dict(
+            # flowrate is link-addressed (links=); the node-addressed value
+            # methods take nodes=. Dispatch by attribute name so both share
+            # one call site.
+            channel_kw = "links" if quantity == "flowrate" else "nodes"
+            df = getattr(q, quantity)(
                 scenario=scenario,
                 scenarios=scen_list,
                 t_start=t_start,
                 t_end=t_end,
                 wide=wide,
+                **{channel_kw: names_list},
             )
-            if quantity == "flowrate":
-                df = q.flowrate(links=names_list, **kwargs)
-            else:
-                df = getattr(q, quantity)(nodes=names_list, **kwargs)
         elif quantity == "labels":
             df = q.labels(
                 scenario=scenario,
@@ -606,9 +617,7 @@ def cli_query(
         _emit_query_result(df, out, limit, index=wide)
 
 
-def _emit_query_result(
-    df: pd.DataFrame, out: Path | None, limit: int, index: bool
-) -> None:
+def _emit_query_result(df: pd.DataFrame, out: Path | None, limit: int, index: bool) -> None:
     """Write the query result to a file or print a preview."""
 
     if out is not None:

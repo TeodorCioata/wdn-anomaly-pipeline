@@ -36,9 +36,7 @@ class Labels:
     metadata: dict
 
 
-def _leak_label_series(
-    time_index: pd.Index, resolved_leaks: Sequence[ResolvedLeak]
-) -> pd.Series:
+def _leak_label_series(time_index: pd.Index, resolved_leaks: Sequence[ResolvedLeak]) -> pd.Series:
     labels = pd.Series(0, index=time_index, name="label", dtype="int8")
     if not resolved_leaks:
         return labels
@@ -79,7 +77,7 @@ def _detect_interactions(
     - a ``pressure`` fault on the inserted leak junction, or
     - a ``flowrate`` fault on either segment of the split pipe.
 
-    The result is **informational only** (decision D24 / Week 5 plan):
+    The result is **informational only** (Week 5 plan):
     it is surfaced in the sidecar metadata so a downstream consumer can
     see that the leak signature and the sensor fault overlap on the same
     channel, but it never gates the pipeline. The structural leak check
@@ -141,9 +139,7 @@ def build_labels(
     """
 
     leaks = list(resolved_leaks) if resolved_leaks else []
-    sensor_faults = (
-        list(resolved_sensor_faults) if resolved_sensor_faults else []
-    )
+    sensor_faults = list(resolved_sensor_faults) if resolved_sensor_faults else []
     labels = _leak_label_series(time_index, leaks)
     labels = _apply_sensor_fault_windows(labels, sensor_faults)
 

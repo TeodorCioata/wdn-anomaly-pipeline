@@ -1,0 +1,40 @@
+# Normal scenario on Net3 with a water-age analysis.
+#
+# Water age tracks how long (in seconds) the water at each node has been
+# in the network since entering at a source. It needs no species or
+# source: every node starts at age 0 and water ages as it travels, so
+# nodes far from a reservoir carry the oldest water. Long residence time
+# is a common proxy for water quality degradation.
+#
+# Like all quality analyses this runs through the EpanetSimulator and is
+# only valid without leaks. A 48-hour horizon lets the age field develop
+# past the initial fill transient. Age is written as a `quality` output
+# table in seconds (divide by 3600 for hours).
+
+network:
+  inp_path: Net3
+  name: net3
+
+simulation:
+  duration_seconds: 172800         # 48 hours
+  hydraulic_timestep_seconds: 3600 # 1 hour
+  report_timestep_seconds: 3600
+  demand_model: DDA
+
+  quality:
+    parameter: age
+    quality_timestep_seconds: 300
+
+seed: 42
+
+demand:
+  mode: default
+
+scenario:
+  type: normal
+  label: normal_age
+
+output:
+  directory: outputs
+  formats: [parquet, csv]
+  write_metadata_sidecar: true
