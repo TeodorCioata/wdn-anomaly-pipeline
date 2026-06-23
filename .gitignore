@@ -219,6 +219,8 @@ networks/*.INP
 configs/scale/
 # Sweep configs are reproducible from scripts/generate_sweep_configs.py
 configs/sweep/
+# Delivery configs are reproducible from scripts/generate_delivery_configs.py
+configs/delivery/
 *.parquet
 *.duckdb
 # EPANET/WNTR temporary simulation files

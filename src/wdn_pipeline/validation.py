@@ -43,6 +43,72 @@ from wdn_pipeline.simulation import SimulationResults
 
 Severity = Literal["ok", "warning", "fail"]
 
+# Hazen-Williams head loss constants, taken verbatim from WNTR's own
+# hydraulic model (WNTR 1.4.0) so the validator checks the simulator
+# against itself rather than an external reference. Sources:
+#   - wntr/sim/models/constants.py::hazen_williams_constants
+#         hw_k = 10.666829500036352   (SI unit-conversion constant)
+#         hw_exp = 1.852              (Hazen-Williams flow exponent mu)
+#         hw_minor_exp = 2           (minor-loss flow exponent)
+#   - wntr/sim/models/param.py::hw_resistance_param.build
+#         k = hw_k * roughness**(-1.852) * diameter**(-4.871) * length
+#   - wntr/sim/models/param.py::minor_loss_param.build
+#         minor_k = 8.0 * minor_loss / (9.81 * pi**2 * diameter**4)
+#   - wntr/sim/models/constraint.py::approx_hazen_williams_headloss_constraint
+#         start_h - end_h = sign(f)*k*|f|**hw_exp
+#                           + eps*k**0.5*f                       (eps = 1e-5)
+#                           + sign(f)*minor_k*f**hw_minor_exp
+# Internal units are SI base units: head in metres, flow in m^3/s, length
+# and diameter in metres. The diameter exponent 4.871 and the constant k
+# are hardcoded in WNTR's param.py; note other references quote 4.8704 /
+# 10.67 / 10.6744. We deliberately use WNTR's exact values.
+#
+# The validator predicts the *idealized* Hazen-Williams head loss
+# (friction + minor terms) and compares it to the simulated head
+# difference. WNTRSimulator additionally solves with a small linear
+# regularization term ``eps*k**0.5*f`` (eps = 1e-5) that smooths the head
+# loss curve near zero flow; that term is a property of WNTR's solver, not
+# of the Hazen-Williams law, so it is excluded from the prediction and
+# instead shows up as the residual. Empirically it bounds the WNTRSimulator
+# residual at ~6e-5 m across the corpus (subtracting it drives the residual
+# to ~1e-9 m), which is why the idealized residual is reported and the OK
+# band sits at 1e-3 m. The EpanetSimulator path (water quality) solves true
+# Hazen-Williams without the eps term, with residuals ~8e-4 m at its default
+# convergence accuracy.
+_HW_K = 10.666829500036352
+_HW_EXP = 1.852
+_HW_MINOR_EXP = 2
+_HW_DIAMETER_EXP = 4.871
+_HW_G = 9.81
+
+
+def _hw_resistance(roughness: np.ndarray, diameter: np.ndarray, length: np.ndarray) -> np.ndarray:
+    """Per-pipe Hazen-Williams resistance ``k`` (vectorised, WNTR param.py)."""
+
+    return _HW_K * roughness ** (-_HW_EXP) * diameter ** (-_HW_DIAMETER_EXP) * length
+
+
+def _hw_minor_k(minor_loss: np.ndarray, diameter: np.ndarray) -> np.ndarray:
+    """Per-pipe minor-loss coefficient (vectorised, WNTR param.py)."""
+
+    return 8.0 * minor_loss / (_HW_G * np.pi**2 * diameter**4)
+
+
+def _predict_headloss(k: np.ndarray, minor_k: np.ndarray, q: np.ndarray) -> np.ndarray:
+    """Idealized signed Hazen-Williams head loss for flow ``q``.
+
+    ``dh = sign(q) * (k * |q|**mu + minor_k * |q|**2)`` with ``mu = 1.852``.
+    ``k`` and ``minor_k`` broadcast over the trailing pipe axis of ``q``.
+
+    The signed form validates flow direction (head drops from high head to
+    low head, so ``sign(dh) == sign(q)``). At ``q == 0`` the exponent
+    ``|q|**0.852`` evaluates to ``0`` cleanly (no NaN, since the exponent is
+    positive), so zero-flow open pipes contribute zero predicted head loss.
+    """
+
+    absq = np.abs(q)
+    return np.sign(q) * (k * absq**_HW_EXP + minor_k * absq**_HW_MINOR_EXP)
+
 
 def _max_severity(severities: list[Severity]) -> Severity:
     if "fail" in severities:
@@ -219,6 +285,122 @@ def _check_mass_balance(
         f"max |net_inflow - demand - leak| = {max_residual:.3e} m^3/s "
         f"(tol {cfg.mass_balance_tol_m3s:.0e})",
     )
+
+
+def _check_hazen_williams_headloss(
+    wn: WaterNetworkModel,
+    results: SimulationResults,
+    cfg: ValidationConfig,
+) -> ValidationCheck:
+    """Energy conservation: simulated head drop matches Hazen-Williams.
+
+    For every pipe and timestep this recomputes the head loss from the
+    network geometry and the simulated flow using WNTR's own
+    Hazen-Williams constants (see the module-level ``_HW_*`` block) and
+    compares it to the simulated head difference across the pipe:
+
+        dh_predicted = sign(q) * (k*|q|**1.852 + minor_k*|q|**2)
+        dh_observed  = head[start_node] - head[end_node]
+        residual     = dh_observed - dh_predicted
+
+    This is the second hydraulic conservation law (mass balance is the
+    first). It is a genuine independent check: the prediction comes from
+    geometry and flow only, so a bug in flow or head reporting, a unit
+    error or non-convergence surfaces as a residual.
+
+    Important properties:
+
+    - **Clean frames.** Energy conservation is a property of the true
+      hydraulics, so the check always reads ``results.head`` and
+      ``results.flowrate_clean`` (neither is ever sensor-corrupted). A
+      flowrate sensor fault therefore cannot make this check fail.
+    - **Pipes only.** Iterating ``wn.pipe_name_list`` naturally excludes
+      pumps (head gain) and valves (their own head loss model), which do
+      not obey the pipe head loss relationship.
+    - **Split pipes.** Geometry is read from the post-simulation model, so
+      a leak's two split segments are each checked with their actual
+      post-split length. The leak outflow is a demand at the leak node
+      (mass balance), not a pipe, so it never enters this check.
+    - **Closed pipes.** WNTR does not enforce the head loss relationship
+      on a closed or isolated pipe (it sets ``flow == 0`` instead), so a
+      closed pipe can show an arbitrary head difference at zero flow
+      (e.g. Net3 pipe "330", ``initial_status=Closed``, ~29.5 m). Such
+      pipe-timesteps are excluded via the reported link status. When
+      status is unavailable the fallback excludes exactly-zero-flow
+      pipe-timesteps (a closed pipe always reports flow exactly 0).
+    """
+
+    head = results.head
+    if head is None:
+        return ValidationCheck(
+            "hazen_williams_headloss", "ok", "no head table reported; check skipped"
+        )
+    pipes = list(wn.pipe_name_list)
+    if not pipes:
+        return ValidationCheck("hazen_williams_headloss", "ok", "no pipes in network")
+
+    roughness = np.array([wn.get_link(p).roughness for p in pipes], dtype=float)
+    diameter = np.array([wn.get_link(p).diameter for p in pipes], dtype=float)
+    length = np.array([wn.get_link(p).length for p in pipes], dtype=float)
+    minor_loss = np.array([wn.get_link(p).minor_loss for p in pipes], dtype=float)
+    start_nodes = [wn.get_link(p).start_node_name for p in pipes]
+    end_nodes = [wn.get_link(p).end_node_name for p in pipes]
+
+    k = _hw_resistance(roughness, diameter, length)
+    minor_k = _hw_minor_k(minor_loss, diameter)
+
+    # Clean flow + true head. Reindex by the pipe/node order above so the
+    # geometry vectors line up column-for-column with the data matrices.
+    flow = results.flowrate_clean.reindex(columns=pipes).to_numpy()
+    h_start = head.reindex(columns=start_nodes).to_numpy()
+    h_end = head.reindex(columns=end_nodes).to_numpy()
+    times = head.index.to_numpy()
+
+    dh_obs = h_start - h_end
+    dh_pred = _predict_headloss(k, minor_k, flow)
+    residual = np.abs(dh_obs - dh_pred)
+
+    # Exclude closed/isolated pipe-timesteps: status 0 = closed. Fall back
+    # to exactly-zero flow when status is not reported.
+    if results.link_status is not None:
+        status = results.link_status.reindex(columns=pipes).to_numpy()
+        open_mask = status != 0
+    else:
+        open_mask = flow != 0.0
+    n_closed = int((~open_mask).sum())
+    n_checked = int(open_mask.sum())
+
+    if n_checked == 0:
+        return ValidationCheck(
+            "hazen_williams_headloss",
+            "ok",
+            "no open pipe-timesteps to check (all pipes closed/zero-flow)",
+        )
+
+    masked = np.where(open_mask, residual, 0.0)
+    flat = int(np.argmax(masked))
+    t_i, p_i = np.unravel_index(flat, masked.shape)
+    max_res = float(masked[t_i, p_i])
+    worst_pipe = pipes[p_i]
+    worst_t = int(times[t_i])
+    worst_q = float(flow[t_i, p_i])
+    worst_obs = float(dh_obs[t_i, p_i])
+    worst_pred = float(dh_pred[t_i, p_i])
+
+    if max_res <= cfg.headloss_tol_m:
+        severity: Severity = "ok"
+    elif max_res <= cfg.headloss_warning_tol_m:
+        severity = "warning"
+    else:
+        severity = "fail"
+
+    detail = (
+        f"max |dh_obs - dh_pred| = {max_res:.3e} m at pipe {worst_pipe} t={worst_t}s "
+        f"(q={worst_q:.3e} m^3/s, dh_obs={worst_obs:.4f} m, dh_pred={worst_pred:.4f} m); "
+        f"checked {n_checked} pipe-timestep(s), excluded {n_closed} closed/zero-flow; "
+        f"tol(ok<={cfg.headloss_tol_m:.0e} m, warn<={cfg.headloss_warning_tol_m:.0e} m)"
+    )
+    return ValidationCheck("hazen_williams_headloss", severity, detail)
 
 
 def _check_quality_plausible(
@@ -758,6 +940,7 @@ def validate_normal_scenario(
             _check_finite(results),
             _check_pressure_bounds(results, cfg),
             _check_mass_balance(wn, results, cfg),
+            _check_hazen_williams_headloss(wn, results, cfg),
         ]
     )
 
@@ -782,6 +965,7 @@ def validate_quality_scenario(
             _check_finite(results),
             _check_pressure_bounds(results, cfg),
             _check_mass_balance(wn, results, cfg),
+            _check_hazen_williams_headloss(wn, results, cfg),
             _check_quality_plausible(results, simulation_cfg.quality),
         ]
     )
@@ -811,6 +995,7 @@ def validate_leak_scenario(
             _check_finite(results),
             _check_pressure_bounds(results, cfg),
             _check_mass_balance(wn, results, cfg),
+            _check_hazen_williams_headloss(wn, results, cfg),
             _check_leak_demand_active(results, resolved_leaks),
             _check_leak_pressure_drop(results, resolved_leaks, cfg),
         ]
@@ -868,6 +1053,9 @@ def validate_sensor_fault_scenario(
             finite_check,
             bounds_check,
             mass_check,
+            # Energy conservation reads results.head + results.flowrate_clean
+            # (both uncorrupted), so passing the corrupted results is safe.
+            _check_hazen_williams_headloss(wn, results, cfg),
             _check_sensor_fault_mask_consistent(results, resolved_sensor_faults, masks),
             _check_sensor_fault_signal_applied(results, resolved_sensor_faults, cfg),
         ]
@@ -929,6 +1117,9 @@ def validate_cumulative_scenario(
             finite_check,
             bounds_check,
             _check_mass_balance(wn, clean_results, cfg),
+            # Energy conservation reads results.head + results.flowrate_clean
+            # (both uncorrupted), so passing the corrupted results is safe.
+            _check_hazen_williams_headloss(wn, results, cfg),
             _check_leak_demand_active(clean_results, resolved_leaks),
             _check_leak_pressure_drop(clean_results, resolved_leaks, cfg),
             _check_sensor_fault_mask_consistent(results, resolved_sensor_faults, masks),
