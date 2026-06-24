@@ -221,6 +221,10 @@ configs/scale/
 configs/sweep/
 # Delivery configs are reproducible from scripts/generate_delivery_configs.py
 configs/delivery/
+# Experiment artefacts (regenerable from experiments/ml_utility scripts)
+experiments/ml_utility/configs/
+experiments/ml_utility/data/
+experiments/ml_utility/figures/*.png
 *.parquet
 *.duckdb
 # EPANET/WNTR temporary simulation files
