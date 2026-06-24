@@ -53,6 +53,17 @@ class SimulationResults:
             ``EpanetSimulator``. ``None`` for the default WNTRSimulator
             path. Units depend on the quality parameter: mg/L for
             chemical, seconds for age, percent for trace.
+        head: Total hydraulic head at every node (rows = time, columns =
+            node names) in metres. ``head = pressure head + elevation``;
+            this is WNTR's own reported head, used by the Hazen-Williams
+            head loss validator. Never sensor-corrupted (sensor faults
+            only touch ``pressure`` / ``flowrate``). ``None`` only on
+            legacy results objects built without it.
+        link_status: Per-timestep link status (rows = time, columns =
+            link names): ``1`` = open, ``0`` = closed. Used by the head
+            loss validator to skip closed pipes, on which WNTR enforces
+            ``flow == 0`` instead of the head loss relationship. ``None``
+            if the simulator did not report status.
     """
 
     pressure: pd.DataFrame
@@ -63,6 +74,8 @@ class SimulationResults:
     pressure_clean: pd.DataFrame
     flowrate_clean: pd.DataFrame
     quality: pd.DataFrame | None = None
+    head: pd.DataFrame | None = None
+    link_status: pd.DataFrame | None = None
 
 
 def run_simulation(
@@ -147,6 +160,12 @@ def run_simulation(
 
     quality = results.node["quality"].copy() if "quality" in results.node else None
 
+    # Total head (pressure head + elevation) and per-timestep link status
+    # feed the Hazen-Williams head loss validator. Both simulators report
+    # them; guard with membership in case a future/older release omits one.
+    head = results.node["head"].copy() if "head" in results.node else None
+    link_status = results.link["status"].copy() if "status" in results.link else None
+
     return SimulationResults(
         pressure=pressure,
         flowrate=flowrate,
@@ -156,4 +175,6 @@ def run_simulation(
         pressure_clean=pressure.copy(),
         flowrate_clean=flowrate.copy(),
         quality=quality,
+        head=head,
+        link_status=link_status,
     )

@@ -240,6 +240,10 @@ class SensorFaultInjector:
                 spec.end_time_seconds,
             )
 
+        # head, link_status and quality are never sensor-corrupted (the
+        # injector only touches pressure / flowrate), so they carry over
+        # verbatim. head and link_status feed the head loss validator on
+        # the sensor / cumulative paths.
         new_results = SimulationResults(
             pressure=corrupted_pressure,
             flowrate=corrupted_flowrate,
@@ -248,6 +252,9 @@ class SensorFaultInjector:
             elapsed_seconds=results.elapsed_seconds,
             pressure_clean=clean_pressure,
             flowrate_clean=clean_flowrate,
+            quality=results.quality,
+            head=results.head,
+            link_status=results.link_status,
         )
         return SensorFaultApplyResult(results=new_results, resolved=resolved_list, masks=masks)
 

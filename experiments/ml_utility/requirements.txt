@@ -1,0 +1,8 @@
+# Experiments-only dependencies. These are NOT pipeline dependencies and are
+# deliberately kept out of the project pyproject.toml so the core install stays
+# lean. Install with:  pip install -r experiments/ml_utility/requirements.txt
+#
+# torch is already provided by the project's optional [ml] extra
+# (pip install wdn-anomaly-pipeline[ml]); it is listed here for completeness.
+scikit-learn>=1.4
+torch>=2.0

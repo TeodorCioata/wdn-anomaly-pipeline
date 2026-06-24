@@ -169,6 +169,8 @@ validation:
   pressure_min_warning_tolerance_m: 1.0   # below this -> fail
   pressure_max_m: 150.0
   mass_balance_tol_m3s: 1.0e-3
+  headloss_tol_m: 1.0e-3                   # Hazen-Williams energy-residual OK band
+  headloss_warning_tol_m: 1.0e-1          # above this -> fail
   leak_pressure_drop_min_m: 0.01          # warning floor for leak-aware drop check
   gain_detectability_min_ratio: 0.05      # gain-fault detectability floor
 
@@ -322,12 +324,38 @@ Three baseline checks run on every scenario, plus one extra for leak scenarios:
 | `finite_values` | no NaN / inf | — | any NaN or inf |
 | `pressure_bounds` | within strict range | within tolerance band | beyond tolerance |
 | `mass_balance` | residual ≤ tol | — | residual > tol |
+| `hazen_williams_headloss` | residual ≤ `headloss_tol_m` | ≤ `headloss_warning_tol_m` | beyond |
 | `leak_demand_active` (leak only) | leak_demand > 0 in `[start, end)` and exactly 0 outside | — | mismatch (window or solver bug) |
 | `leak_pressure_drop` (leak only) | drop ≥ floor at every leak | drop below floor (diurnal-confound, diagnostic) | — |
 
 `WARNING` does not cause a non-zero exit code. The motivating example: Net3 produces a small negative pressure (~-0.66 m) at node `10` due to its known elevation/tank-cycle quirk. Both `WNTRSimulator` and the `EpanetSimulator` reference produce this; the validator surfaces it as a warning instead of failing the run. Leak scenarios amplify this dip slightly under PDD + leak conditions, so the `leak_abrupt_net3` config raises its `pressure_min_warning_tolerance_m` to 2 m.
 
 The mass-balance residual subtracts `leak_demand` from the demand side. Without that correction every leak scenario would fail by exactly the leak outflow at every active step.
+
+#### Hazen-Williams head loss (energy conservation)
+
+Mass balance proves conservation of mass. `hazen_williams_headloss` proves the second hydraulic conservation law, conservation of energy: for every **pipe** and timestep it recomputes the head loss from network geometry and the simulated flow and compares it to the simulated head difference across the pipe.
+
+```
+dh_predicted = sign(q) * ( k*|q|^1.852 + minor_k*|q|^2 )
+dh_observed  = head[start_node] - head[end_node]
+residual     = dh_observed - dh_predicted
+k       = 10.666829500036352 * C^(-1.852) * D^(-4.871) * L
+minor_k = 8 * minor_loss / (9.81 * pi^2 * D^4)
+```
+
+The constants (`k`, the flow exponent `1.852`, the diameter exponent `4.871`, the minor-loss form) are taken **verbatim from WNTR's own hydraulic model source** (`wntr/sim/models/constants.py`, `param.py`, `constraint.py`, WNTR 1.4.0), so the validator checks the simulator against itself rather than an external reference. Internal units are SI (head in metres, flow in m³/s, length/diameter in metres). It is a genuine independent check: the prediction comes from geometry and flow only, so a unit error, a head reporting bug or non-convergence surfaces as a residual. The signed form also validates flow direction (head drops from high head to low head, so `sign(dh) == sign(q)`).
+
+Key properties:
+
+- **Clean frames.** Energy conservation is a property of the true hydraulics, so the check always reads the uncorrupted head and `flowrate_clean` frames. A flowrate sensor fault cannot make it fail.
+- **Pipes only.** Pumps (head gain) and valves (their own loss model) are excluded.
+- **Split pipes.** Geometry is read from the post-simulation model, so a leak's two split segments are each checked with their actual post-split length. The leak outflow is a demand at the leak node (mass balance), not a pipe.
+- **Closed pipes.** WNTR enforces only `flow == 0` on a closed or isolated pipe, not the head loss law, so a closed pipe can carry an arbitrary head difference at zero flow (e.g. Net3 pipe `330`, initially closed, ~29.5 m). Such pipe-timesteps are excluded via the reported link status.
+
+`WNTRSimulator` additionally solves with a small linear regularization term (`eps*k^0.5*q`, `eps=1e-5`) that smooths the head loss curve near zero flow; that term is a property of WNTR's solver, not of the Hazen-Williams law, so it is excluded from the prediction and shows up as the residual. Empirically it bounds the WNTRSimulator residual at ~6e-5 m across the corpus (subtracting it drives the residual to ~1e-9 m), which is why the OK band defaults to `1e-3` m. The `EpanetSimulator` path (water quality scenarios) solves true Hazen-Williams without the eps term, with residuals ~8e-4 m at EPANET's default convergence accuracy.
+
+Across the full corpus (standard configs, the ~520-scenario scale set and the LeakG3PD sweep, 527 scenarios that converge) the check passes at OK on every scenario with **max residual 8.3e-4 m** (EPANET water-quality path) and **6.4e-5 m on the WNTRSimulator path** (median ~2.5e-5 m). Tolerances live in the `validation` block (`headloss_tol_m`, `headloss_warning_tol_m`); this check validates Hazen-Williams only, consistent with the project's single simulator. Reproduce with `python scripts/headloss_corpus_report.py`.
 
 Per-timestep labels and the `leak_demand_active` check both use a **half-open active window** `[start_time, end_time)`. WNTR's end control flips `leak_status=False` at `end_time_seconds`, so the reported `leak_demand` at that exact step is already zero by design. Including the end timestep would mark a normal frame as anomalous; the `leak_demand_active` validator polices this invariant and fails if the label disagrees with the simulator.
 
@@ -506,7 +534,7 @@ train_ds = WDNWindowDataset("outputs/scale_run.duckdb", train, window_length=24)
 pytest
 ```
 
-Currently **280 tests** covering every module: config schema (with leak-spec, sensor-fault discriminated union incl. unknown-type and foreign-field rejection, calibration, water-quality and DuckDB invariants), network loading, hydraulic calibration options (allowlist + validated passthrough, PDD-only and D-W guards), water quality (chemical / age / trace, leak+quality rejection, EpanetSimulator routing, quality plausibility bounds), demand strategies, simulation (the empty-result and `error_code` non-convergence guards), leak injection (abrupt + linear + multi, including two leaks on one pipe), sensor fault injection (bias / drift / stuck / dropout / noise / gain, including multiple faults on one channel), leak-node cleanup post-processing, cumulative scenarios, PDD normal scenarios, labelling, validation severity (leak-aware mass balance run on clean frames, leak demand active, sensor fault mask consistency, sensor fault signal applied with n-aware noise tolerance, gain detectability, water-quality plausibility), output writers, DuckDB single-scenario / batch / round-trip / idempotency / long-table population, the `DatasetQuery` query layer and `wdn-pipeline query` CLI (slicing, half-open windows, wide round-trip, read-only safety, parametrised-binding injection safety), the ML loader (scenario-level split, windowed dataset with an eager-load cap), the CLI command routing (legacy + subcommand forms), the LeakG3PD network sweep smoke tests, organise-outputs categorisation and README rendering, batch driver (sequential + parallel parity, duplicate-basename guard) and end-to-end runner determinism.
+Currently **295 tests** covering every module: config schema (with leak-spec, sensor-fault discriminated union incl. unknown-type and foreign-field rejection, calibration, water-quality and DuckDB invariants), network loading, hydraulic calibration options (allowlist + validated passthrough, PDD-only and D-W guards), water quality (chemical / age / trace, leak+quality rejection, EpanetSimulator routing, quality plausibility bounds), demand strategies, simulation (the empty-result and `error_code` non-convergence guards), leak injection (abrupt + linear + multi, including two leaks on one pipe), sensor fault injection (bias / drift / stuck / dropout / noise / gain, including multiple faults on one channel), leak-node cleanup post-processing, cumulative scenarios, PDD normal scenarios, labelling, validation severity (leak-aware mass balance run on clean frames, Hazen-Williams head loss energy conservation incl. hand-calc, sign sensitivity, minor losses, closed-pipe exclusion and clean-frame behaviour, leak demand active, sensor fault mask consistency, sensor fault signal applied with n-aware noise tolerance, gain detectability, water-quality plausibility), output writers, DuckDB single-scenario / batch / round-trip / idempotency / long-table population, the `DatasetQuery` query layer and `wdn-pipeline query` CLI (slicing, half-open windows, wide round-trip, read-only safety, parametrised-binding injection safety), the ML loader (scenario-level split, windowed dataset with an eager-load cap), the CLI command routing (legacy + subcommand forms), the LeakG3PD network sweep smoke tests, organise-outputs categorisation and README rendering, batch driver (sequential + parallel parity, duplicate-basename guard) and end-to-end runner determinism.
 
 ---
 
@@ -627,12 +655,11 @@ Runs every config in `configs/` twice into separate output directories and compa
 - **Water quality options:** chemical / age / trace analysis via the EpanetSimulator for non-leak scenarios (`simulation.quality`), exposed as a `quality` output table and through `DatasetQuery.quality()` / `wdn-pipeline query --quantity quality`. Leak + quality combinations are rejected. `configs/normal_net3_chemical.yaml`, `configs/normal_net3_age.yaml`
 - **ML loader:** `wdn_pipeline.ml` with a scenario-level train/test split and a windowed PyTorch `Dataset` (optional `ml` extra)
 - **Delivery polish:** mypy clean (`mypy src`), `ruff check` and `ruff format` clean across `src`/`tests`/`scripts`, MIT `LICENSE`, fresh-environment install verified from `pyproject.toml`. The fresh-env check fixed three install defects: a missing `numpy<2.4` pin, an undeclared `click` dependency and a CLI command-routing regression under newer click
-- **280 tests total**, mypy + ruff clean
+- **295 tests total**, mypy + ruff clean
 
 ### Upcoming
 
 - Phase 6 (Weeks 9-10): final report (LaTeX).
-- Phase 6: report writing
 
 ---
 

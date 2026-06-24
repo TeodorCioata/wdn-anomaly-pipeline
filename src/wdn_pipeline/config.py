@@ -653,6 +653,18 @@ class ValidationConfig(_Frozen):
             low-variance channel is statistically indistinguishable
             from normal sensor noise and would mislabel ML training
             data.
+        headloss_tol_m: Strict OK ceiling (metres) for the
+            Hazen-Williams head loss residual ``|dh_observed -
+            dh_predicted|`` aggregated over every open pipe and timestep.
+            Default ``1e-3`` m comfortably accommodates the WNTRSimulator
+            near-zero-flow regularization term (~6e-5 m on the corpus)
+            and the EpanetSimulator convergence precision (~8e-4 m) while
+            staying far below any real energy violation.
+        headloss_warning_tol_m: WARNING ceiling (metres). A residual
+            above ``headloss_tol_m`` but at or below this value is a
+            warning (a near-miss); above it is a hard failure (a unit
+            error, a head reporting bug or non-convergence that slipped
+            through). Must be >= ``headloss_tol_m``.
     """
 
     pressure_min_m: float = 0.0
@@ -661,6 +673,17 @@ class ValidationConfig(_Frozen):
     mass_balance_tol_m3s: Annotated[float, Field(gt=0)] = 1e-3
     leak_pressure_drop_min_m: Annotated[float, Field(ge=0)] = 0.01
     gain_detectability_min_ratio: Annotated[float, Field(ge=0)] = 0.05
+    headloss_tol_m: Annotated[float, Field(gt=0)] = 1e-3
+    headloss_warning_tol_m: Annotated[float, Field(gt=0)] = 1e-1
+
+    @model_validator(mode="after")
+    def _validate_headloss_bands(self) -> ValidationConfig:
+        if self.headloss_warning_tol_m < self.headloss_tol_m:
+            raise ValueError(
+                "validation.headloss_warning_tol_m must be >= validation.headloss_tol_m "
+                f"(got warning={self.headloss_warning_tol_m}, ok={self.headloss_tol_m})"
+            )
+        return self
 
 
 class PipelineConfig(_Frozen):
